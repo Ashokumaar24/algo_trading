@@ -1,0 +1,221 @@
+# ============================================================
+#  strategies/vwap_pullback.py
+#  VWAP Pullback Strategy — Core strategy of the AI Hybrid
+#  Trend: 20 EMA + VWAP  |  Entry on pullback + confirmation candle
+# ============================================================
+
+import pandas as pd
+from datetime import time, datetime
+from typing import Optional
+
+from strategies.base_strategy import BaseStrategy, Signal, Direction
+from utils.indicators import ema, vwap, atr, ema_slope
+from config.config import (
+    VWAP_EMA_PERIOD, VWAP_TOLERANCE_PCT, VWAP_ENTRY_DEADLINE,
+    VWAP_TRAIL_AFTER_1R
+)
+from utils.logger import get_logger
+
+logger = get_logger("vwap_pullback")
+
+
+class VWAPPullbackStrategy(BaseStrategy):
+    """
+    VWAP Pullback Trend Continuation Strategy.
+
+    LONG Setup:
+    1. Price above VWAP AND VWAP > 20 EMA (uptrend)
+    2. 20 EMA sloping upward (EMA[-1] > EMA[-3])
+    3. Previous candle pulled back to VWAP (low ≤ VWAP + tolerance)
+    4. Previous candle CLOSED above VWAP (held above)
+    5. Current (signal) candle: bullish close above prev high
+
+    Stop Loss:  Below pullback candle low OR below VWAP (whichever is lower)
+    Target 1R:  Move SL to breakeven
+    Target 2R:  Full exit
+
+    SHORT Setup: Mirror logic with inverted conditions.
+    """
+
+    def __init__(self):
+        super().__init__("VWAP_PULLBACK")
+        self._pullback_seen: dict   = {}  # {symbol: candle}
+        self._trade_taken: set      = set()
+
+    def reset_daily(self):
+        self._pullback_seen.clear()
+        self._trade_taken.clear()
+        logger.info("VWAP Pullback: Daily reset complete")
+
+    def check_entry(self, symbol: str, candle: dict,
+                    candle_history: pd.DataFrame,
+                    prev_candle: Optional[dict] = None) -> Optional[Signal]:
+        """
+        Check for VWAP pullback entry on the current closed candle.
+
+        Args:
+            symbol:         Stock symbol
+            candle:         Current completed 5-min candle
+            candle_history: DataFrame of historical 5-min candles
+            prev_candle:    Previous closed candle (for pullback check)
+
+        Returns:
+            Signal or None
+        """
+        if symbol in self._trade_taken:
+            return None
+
+        candle_time = candle.get('timestamp', datetime.now())
+        if isinstance(candle_time, datetime):
+            if candle_time.time() > VWAP_ENTRY_DEADLINE:
+                return None
+
+        if not self._validate_candle_count(candle_history, 25):
+            return None
+
+        if prev_candle is None and len(candle_history) >= 2:
+            prev_candle = candle_history.iloc[-2].to_dict()
+
+        if prev_candle is None:
+            return None
+
+        # --- Compute Indicators ---
+        ema20       = ema(candle_history['close'], VWAP_EMA_PERIOD)
+        vwap_series = vwap(
+            candle_history['high'], candle_history['low'],
+            candle_history['close'], candle_history['volume']
+        )
+        atr_val = atr(
+            candle_history['high'], candle_history['low'],
+            candle_history['close'], period=14
+        ).iloc[-1]
+
+        ema20_curr  = ema20.iloc[-1]
+        ema20_prev3 = ema20.iloc[-3] if len(ema20) >= 3 else ema20.iloc[0]
+        vwap_curr   = vwap_series.iloc[-1]
+
+        close = candle['close']
+        open_ = candle['open']
+        high  = candle['high']
+        low   = candle['low']
+
+        prev_close = prev_candle.get('close', prev_candle.get('Close'))
+        prev_high  = prev_candle.get('high',  prev_candle.get('High'))
+        prev_low   = prev_candle.get('low',   prev_candle.get('Low'))
+
+        tol = vwap_curr * VWAP_TOLERANCE_PCT
+
+        # ================================================================
+        # LONG SETUP
+        # ================================================================
+        trend_up = (
+            close > vwap_curr and                       # price above VWAP
+            vwap_curr > ema20_curr and                  # VWAP above EMA
+            ema20_curr > ema20_prev3                    # EMA sloping up
+        )
+
+        pullback_to_vwap_long = (
+            prev_low <= vwap_curr + tol and             # prev candle touched VWAP
+            prev_close > vwap_curr                      # but closed above VWAP
+        )
+
+        confirmation_long = (
+            close > open_ and                           # current is bullish
+            close > prev_high and                       # breaks above prev high
+            low > vwap_curr - tol                       # stays above VWAP
+        )
+
+        if trend_up and pullback_to_vwap_long and confirmation_long:
+            sl     = min(prev_low, vwap_curr - tol) - atr_val * 0.1
+            risk   = close - sl
+            target = close + 2.0 * risk                 # 1:2 RR
+            t1     = close + 1.0 * risk                 # 1R for breakeven move
+
+            conf = self._confidence(close, vwap_curr, ema20_curr, ema20_prev3,
+                                    atr_val, "LONG")
+
+            signal = Signal(
+                symbol=symbol, direction=Direction.LONG, strategy=self.name,
+                entry=round(close, 2), stop_loss=round(sl, 2),
+                target=round(target, 2), target_2=round(target, 2),
+                trail_trigger=round(risk, 2), confidence=conf,
+                notes=(f"VWAP Pullback Long | VWAP:{vwap_curr:.2f} "
+                       f"EMA20:{ema20_curr:.2f} ATR:{atr_val:.2f}")
+            )
+
+            if signal.is_valid() and signal.reward_risk >= 1.3:
+                logger.info(f"SIGNAL: {signal}")
+                self._trade_taken.add(symbol)
+                return signal
+
+        # ================================================================
+        # SHORT SETUP
+        # ================================================================
+        trend_down = (
+            close < vwap_curr and
+            vwap_curr < ema20_curr and
+            ema20_curr < ema20_prev3
+        )
+
+        pullback_to_vwap_short = (
+            prev_high >= vwap_curr - tol and
+            prev_close < vwap_curr
+        )
+
+        confirmation_short = (
+            close < open_ and                           # current is bearish
+            close < (prev_low if prev_low else close) and
+            high < vwap_curr + tol
+        )
+
+        if trend_down and pullback_to_vwap_short and confirmation_short:
+            sl     = max(prev_high, vwap_curr + tol) + atr_val * 0.1
+            risk   = sl - close
+            target = close - 2.0 * risk
+            t1     = close - 1.0 * risk
+
+            conf = self._confidence(close, vwap_curr, ema20_curr, ema20_prev3,
+                                    atr_val, "SHORT")
+
+            signal = Signal(
+                symbol=symbol, direction=Direction.SHORT, strategy=self.name,
+                entry=round(close, 2), stop_loss=round(sl, 2),
+                target=round(target, 2), target_2=round(target, 2),
+                trail_trigger=round(risk, 2), confidence=conf,
+                notes=(f"VWAP Pullback Short | VWAP:{vwap_curr:.2f} "
+                       f"EMA20:{ema20_curr:.2f} ATR:{atr_val:.2f}")
+            )
+
+            if signal.is_valid() and signal.reward_risk >= 1.3:
+                logger.info(f"SIGNAL: {signal}")
+                self._trade_taken.add(symbol)
+                return signal
+
+        return None
+
+    def _confidence(self, close, vwap_val, ema20, ema20_3ago,
+                    atr_val, direction) -> float:
+        score = 50.0
+
+        # EMA trend strength
+        ema_slope_pct = abs(ema20 - ema20_3ago) / ema20_3ago * 100
+        if ema_slope_pct > 0.05:
+            score += 20
+        elif ema_slope_pct > 0.02:
+            score += 10
+
+        # Distance from VWAP (should be modest — not too extended)
+        dist_pct = abs(close - vwap_val) / vwap_val * 100
+        if 0.1 <= dist_pct <= 0.5:
+            score += 20
+        elif dist_pct < 0.1:
+            score += 5  # too close to VWAP — chop risk
+        elif dist_pct > 0.8:
+            score -= 10  # too extended
+
+        # ATR context
+        atr_pct = atr_val / close * 100
+        if 0.3 <= atr_pct <= 1.0:
+            score += 10
+
+        return min(max(round(score, 1), 0), 100.0)

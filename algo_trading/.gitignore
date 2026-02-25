@@ -1,0 +1,58 @@
+# ============================================================
+#  ALGO TRADING — .gitignore
+#  NEVER commit credentials or sensitive files
+# ============================================================
+
+# ---- Credentials & API Keys (CRITICAL - never commit) ----
+api_key.txt
+access_token.txt
+request_token.txt
+*.secret
+.env
+.env.local
+secrets/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+.venv/
+venv/
+ENV/
+env/
+
+# ---- Logs & Data ----
+logs/*.log
+logs/*.txt
+data/*.csv
+data/*.parquet
+data/*.pkl
+*.log
+
+# ---- IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+*.ipynb
+
+# ---- Testing ----
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# ---- OS ----
+Desktop.ini
