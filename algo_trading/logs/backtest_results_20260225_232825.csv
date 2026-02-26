@@ -1,0 +1,5 @@
+strategy,total_trades,win_rate_pct,avg_rr,expectancy_inr,profit_factor,sharpe_ratio,max_drawdown_pct,total_net_pnl,total_cost_drag,annual_return_pct,avg_hold_mins,target_hit_pct
+ORB_15,364,41.2,0.65,-953.0,0.56,-3.79,36.77,-346806.0,345187.0,-34.7,264.0,10.2
+VWAP_PULLBACK,187,33.2,1.2,-2673.0,0.44,-6.35,49.7,-499858.0,515837.0,-50.0,94.0,27.3
+EMA_RSI,367,33.5,1.01,-3927.0,0.21,-11.53,143.82,-1441231.0,1233554.0,-144.1,41.0,31.3
+BREAKOUT_ATR,5,20.0,0.51,-1581.0,0.27,-7.59,1.08,-7905.0,1605.0,-0.8,217.0,0.0

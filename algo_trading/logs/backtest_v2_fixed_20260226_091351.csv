@@ -1,0 +1,4 @@
+strategy,total_trades,win_rate_pct,avg_rr,expectancy_inr,profit_factor,sharpe_ratio,max_drawdown_pct,total_net_pnl,gross_pnl,total_cost_drag,annual_return_pct,avg_hold_mins,target_hit_pct,sl_hit_pct,eod_close_pct,regime_blocked_days,confidence_filtered,trade_cap_blocked
+ORB_15,230,40.0,0.53,-548.0,0.66,-2.65,13.33,-126110.0,88002.0,214111.0,-12.6,130.0,12.2,9.6,0.0,0,1,281
+VWAP_PULLBACK,129,31.0,1.14,-2688.0,0.42,-6.66,36.65,-346755.0,-31786.0,314969.0,-34.7,100.0,23.3,56.6,20.2,0,46,61
+BREAKOUT_ATR,5,0.0,0.59,-3483.0,0.0,-23.41,1.16,-17413.0,-14403.0,3009.0,-1.7,205.0,0.0,40.0,60.0,0,0,3

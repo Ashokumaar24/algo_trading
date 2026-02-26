@@ -1,0 +1,6 @@
+strategy,total_trades,win_rate_pct,avg_rr,expectancy_inr,profit_factor,sharpe_ratio,max_drawdown_pct,total_net_pnl,gross_pnl,total_cost_drag,annual_return_pct,avg_hold_mins,target_hit_pct,sl_hit_pct,eod_close_pct,regime_blocked_days,confidence_filtered,trade_cap_blocked,confidence_threshold
+ORB_15,221,39.8,0.54,-626.0,0.63,-2.95,14.88,-138400.0,74713.0,213113.0,-13.8,128.0,12.7,10.9,0.9,4,20,253,80
+ORB_15,192,39.1,0.6,-903.0,0.54,-4.02,17.79,-173301.0,29839.0,203140.0,-17.3,129.0,13.5,14.1,0.5,4,93,178,85
+ORB_15,192,39.1,0.6,-903.0,0.54,-4.02,17.79,-173301.0,29839.0,203140.0,-17.3,129.0,13.5,14.1,0.5,4,93,178,90
+ORB_15,113,40.7,0.63,-917.0,0.56,-3.85,11.75,-103654.0,33535.0,137189.0,-10.4,122.0,15.9,17.7,0.9,4,228,56,92
+ORB_15,113,40.7,0.63,-917.0,0.56,-3.85,11.75,-103654.0,33535.0,137189.0,-10.4,122.0,15.9,17.7,0.9,4,228,56,95
