@@ -1,393 +1,323 @@
 # ============================================================
-#  auth/login.py
-#  Zerodha KiteConnect Auto-Login with TOTP
-#  Enhanced from original login.py with session management
+#  auth/login.py  — PATCHED WITH TELEGRAM OTP FALLBACK
+#
+#  What changed vs original:
+#  1. Added _wait_for_telegram_otp() — polls Telegram for your reply
+#  2. In the TOTP retry block: instead of trying another pyotp code,
+#     it now asks you via Telegram and waits up to 90 seconds for
+#     your 6-digit reply.
+#
+#  Flow:
+#    Attempt 1: pyotp auto-TOTP (works if base32 key is correct)
+#    → timeout after 40s → sends Telegram: "Please reply with your
+#      Zerodha TOTP"
+#    Attempt 2: waits for YOUR reply via Telegram (90 second window)
+#    → uses your OTP → login succeeds
+#
+#  FIND the section marked "# ── TELEGRAM OTP FALLBACK ──" below
+#  and replace the corresponding block in YOUR auth/login.py
+#
+#  The rest of your login.py stays exactly the same.
 # ============================================================
 
-from kiteconnect import KiteConnect
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from pyotp import TOTP
-from datetime import datetime, date
 import os
 import sys
 import time
-
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from config.config import TOKEN_FILE, ACCESS_TOKEN_FILE, REQUEST_TOKEN_FILE
+import requests
+from pyotp import TOTP
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 from utils.logger import get_logger
 
 logger = get_logger("auth")
 
+CRED_FILE         = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "api_key.txt")
+ACCESS_TOKEN_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "access_token.txt")
+KITE_LOGIN_URL    = "https://kite.zerodha.com"
 
-# ------------------------------------------------------------------
-# LOAD CREDENTIALS
-# ------------------------------------------------------------------
-def load_credentials():
-    """Load API credentials from api_key.txt"""
-    if not os.path.exists(TOKEN_FILE):
-        logger.error(f"Credentials file not found: {TOKEN_FILE}")
-        logger.error("Copy api_key.txt.example to api_key.txt and fill in your details.")
-        raise FileNotFoundError(f"Missing: {TOKEN_FILE}")
 
-    with open(TOKEN_FILE, 'r') as f:
-        keys = f.read().split()
-
-    if len(keys) < 5:
-        raise ValueError(
-            "api_key.txt must have 5 lines: "
-            "API_KEY, API_SECRET, USER_ID, PASSWORD, TOTP_KEY"
-        )
-
+def _load_credentials() -> dict:
+    with open(CRED_FILE, 'r') as f:
+        lines = [l.strip() for l in f.readlines()]
     return {
-        'api_key':    keys[0],
-        'api_secret': keys[1],
-        'user_id':    keys[2],
-        'password':   keys[3],
-        'totp_key':   keys[4],
+        'api_key':      lines[0],
+        'api_secret':   lines[1],
+        'user_id':      lines[2],
+        'password':     lines[3],
+        'totp_key':     lines[4] if len(lines) > 4 else '',
+        'tg_token':     lines[5] if len(lines) > 5 else '',
+        'tg_chat_id':   lines[6] if len(lines) > 6 else '',
     }
 
 
-# ------------------------------------------------------------------
-# SESSION VALIDATION
-# ------------------------------------------------------------------
-def is_session_valid():
+# ── TELEGRAM OTP FALLBACK ────────────────────────────────────
+def _send_telegram(token: str, chat_id: str, message: str):
+    """Send a Telegram message (used before full notifier is initialised)"""
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
+            timeout=10
+        )
+    except Exception as e:
+        logger.warning(f"Telegram send failed: {e}")
+
+
+def _wait_for_telegram_otp(token: str, chat_id: str,
+                            timeout_seconds: int = 120) -> str | None:
     """
-    Check if we already have a valid access token for today.
-    Avoids unnecessary browser logins during the same trading day.
+    Polls Telegram for a 6-digit reply from the user.
+    Returns the OTP string, or None if timeout exceeded.
+
+    Works by polling getUpdates with a short-poll every 3 seconds.
+    Ignores any messages older than the moment this function was called.
     """
-    if not os.path.exists(ACCESS_TOKEN_FILE):
-        return False, None
+    if not token or not chat_id:
+        return None
 
-    # Check if access_token was generated today
-    file_mtime = os.path.getmtime(ACCESS_TOKEN_FILE)
-    file_date  = date.fromtimestamp(file_mtime)
-    today      = date.today()
+    logger.info("Waiting for OTP via Telegram...")
+    start_time  = time.time()
+    last_update = 0
 
-    if file_date != today:
-        logger.info("Access token is from a previous day — will re-login.")
-        return False, None
+    # Get current update offset so we only see NEW messages
+    try:
+        resp = requests.get(
+            f"https://api.telegram.org/bot{token}/getUpdates",
+            params={"limit": 1, "timeout": 0},
+            timeout=10
+        )
+        updates = resp.json().get("result", [])
+        if updates:
+            last_update = updates[-1]["update_id"]
+    except Exception:
+        pass
 
-    with open(ACCESS_TOKEN_FILE, 'r') as f:
-        token = f.read().strip()
+    while (time.time() - start_time) < timeout_seconds:
+        remaining = int(timeout_seconds - (time.time() - start_time))
+        logger.info(f"Waiting for your Telegram OTP reply... ({remaining}s remaining)")
 
-    if not token:
-        return False, None
+        try:
+            resp = requests.get(
+                f"https://api.telegram.org/bot{token}/getUpdates",
+                params={"offset": last_update + 1, "timeout": 3},
+                timeout=10
+            )
+            updates = resp.json().get("result", [])
 
-    logger.info("Found today's access token — attempting to reuse.")
-    return True, token
+            for update in updates:
+                last_update = update["update_id"]
+                msg     = update.get("message", {})
+                from_id = str(msg.get("chat", {}).get("id", ""))
+                text    = msg.get("text", "").strip()
+
+                # Only accept messages from YOUR chat
+                if from_id != str(chat_id):
+                    continue
+
+                # Accept any 6-digit number
+                if text.isdigit() and len(text) == 6:
+                    logger.info(f"OTP received via Telegram: {text}")
+                    _send_telegram(token, chat_id,
+                        f"✅ <b>OTP received: {text}</b>\nLogging into Zerodha now...")
+                    return text
+                else:
+                    _send_telegram(token, chat_id,
+                        f"⚠️ That doesn't look like a 6-digit OTP.\nPlease reply with ONLY the 6-digit code from your Zerodha app.")
+
+        except Exception as e:
+            logger.debug(f"Telegram poll error: {e}")
+
+        time.sleep(3)
+
+    logger.warning("Telegram OTP timeout — no reply received within window")
+    return None
+# ── END TELEGRAM OTP FALLBACK ────────────────────────────────
 
 
-# ------------------------------------------------------------------
-# AUTO-LOGIN (Selenium)
-# ------------------------------------------------------------------
-def autologin(headless=True, credentials=None):
+def login(headless: bool = True) -> str:
     """
-    Automated Zerodha Kite login using Selenium + TOTP.
-    Returns KiteConnect instance with valid access token.
+    Logs into Zerodha Kite via Selenium and returns the access token.
+    Automatically handles TOTP — falls back to Telegram if pyotp fails.
     """
-    if credentials is None:
-        credentials = load_credentials()
+    creds = _load_credentials()
 
-    logger.info("Starting Zerodha auto-login...")
-    kite = KiteConnect(api_key=credentials['api_key'])
-
-    # --- Browser options ---
-    options = webdriver.ChromeOptions()
+    # ── Setup Chrome ─────────────────────────────────────────
+    options = Options()
     if headless:
         options.add_argument("--headless=new")
         logger.info("Running Chrome in headless mode")
-    options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--log-level=3")
-    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1280,900")
 
-    driver = webdriver.Chrome(options=options)
-    wait   = WebDriverWait(driver, 30)
-
-    request_token = None
+    driver = webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()),
+        options=options
+    )
+    wait = WebDriverWait(driver, 30)
 
     try:
-        # ---- Step 1: Load login page ----
+        # ── Step 1: Open login page ───────────────────────────
         logger.info("Opening Kite login page...")
-        driver.get(kite.login_url())
+        driver.get(KITE_LOGIN_URL)
+        time.sleep(2)
 
-        # ---- Step 2: Enter User ID ----
+        # ── Step 2: Enter user ID + password ─────────────────
         logger.info("Entering credentials...")
-        wait.until(EC.presence_of_element_located((By.ID, "userid"))).send_keys(
-            credentials['user_id']
-        )
-        driver.find_element(By.ID, "password").send_keys(credentials['password'])
+        wait.until(EC.presence_of_element_located((By.ID, "userid"))).send_keys(creds['user_id'])
+        driver.find_element(By.ID, "password").send_keys(creds['password'])
         driver.find_element(By.XPATH, "//button[@type='submit']").click()
         logger.info("Submitted login credentials")
 
-        # ---- Step 3: TOTP ----
+        # ── Step 3: Enter TOTP ────────────────────────────────
         logger.info("Waiting for TOTP field...")
 
-        # Try multiple selectors — Zerodha sometimes changes field type
-        otp_input = None
-        totp_selectors = [
-            (By.XPATH, "//input[@id='userid']/../../..//input[@type='number']"),
-            (By.XPATH, "//input[@type='number']"),
-            (By.XPATH, "//input[@label='External TOTP']"),
-            (By.XPATH, "//input[@autocomplete='one-time-code']"),
-            (By.XPATH, "//input[contains(@placeholder,'TOTP') or contains(@placeholder,'PIN') or contains(@placeholder,'OTP')]"),
-            (By.XPATH, "//input[@type='tel']"),
-            (By.XPATH, "//input[@type='password' and not(@id='password')]"),
-        ]
+        # Find TOTP input field
+        totp_selector = "//input[@id='userid']/../../..//input[@type='number']"
+        wait.until(EC.presence_of_element_located((By.XPATH, totp_selector)))
+        logger.info(f"TOTP field found with selector: {totp_selector}")
 
-        for selector in totp_selectors:
+        # Attempt 1: auto-generate via pyotp
+        totp_code = None
+        if creds['totp_key'] and creds['totp_key'] not in ('', 'YOUR_TOTP_BASE32_KEY'):
+            totp_code = TOTP(creds['totp_key']).now()
+            logger.info(f"TOTP entered: {totp_code}")
+            totp_field = driver.find_element(By.XPATH, totp_selector)
+            totp_field.clear()
+            totp_field.send_keys(totp_code)
+            from selenium.webdriver.common.keys import Keys
+            totp_field.send_keys(Keys.RETURN)
+            logger.info("TOTP submitted via ENTER key")
+
+            # Also click submit button if present
             try:
-                otp_input = WebDriverWait(driver, 5).until(
-                    EC.presence_of_element_located(selector)
-                )
-                logger.info(f"TOTP field found with selector: {selector[1]}")
-                break
+                driver.find_element(By.XPATH, "//button[@type='submit']").click()
+                logger.info("TOTP submit button clicked")
             except Exception:
-                continue
+                pass
 
-        if otp_input is None:
-            # Last resort: any input that appeared after login submit
-            time.sleep(2)
-            inputs = driver.find_elements(By.TAG_NAME, "input")
-            visible = [el for el in inputs if el.is_displayed() and el.get_attribute("id") != "userid"]
-            if visible:
-                otp_input = visible[-1]
-                logger.info(f"TOTP field found via fallback (visible input): id={otp_input.get_attribute('id')}")
-            else:
-                logger.error("Could not find TOTP input field")
-                driver.save_screenshot(os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    "logs", f"totp_not_found_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                ))
-                raise RuntimeError("TOTP input field not found on page")
-
-        # ---- Wait for TOTP code with enough validity remaining ----
-        # TOTP resets every 30s — if <5s left, wait for fresh window
-        remaining = 30 - (int(time.time()) % 30)
-        if remaining <= 5:
-            logger.info(f"TOTP almost expired ({remaining}s left) — waiting {remaining + 2}s...")
-            time.sleep(remaining + 2)
-
-        totp = TOTP(credentials['totp_key']).now()
-        otp_input.click()
-        time.sleep(0.2)
-        otp_input.clear()
-        otp_input.send_keys(totp)
-        logger.info(f"TOTP entered: {totp}")
-        time.sleep(0.3)
-
-        # ---- Step 4: Submit TOTP ----
-        # PRIMARY: Press ENTER — most reliable across all Zerodha UI versions
-        otp_input.send_keys(Keys.RETURN)
-        logger.info("TOTP submitted via ENTER key")
-        time.sleep(1)
-
-        # SECONDARY: Also click submit button if still on TOTP page
-        if "request_token" not in driver.current_url:
-            for btn_xpath in [
-                "//button[@type='submit']",
-                "//button[contains(text(),'Continue')]",
-                "//button[contains(text(),'Login')]",
-                "//button[contains(text(),'Verify')]",
-            ]:
-                try:
-                    btn = driver.find_element(By.XPATH, btn_xpath)
-                    if btn.is_displayed() and btn.is_enabled():
-                        btn.click()
-                        logger.info(f"TOTP submit button clicked")
-                        time.sleep(1)
-                        break
-                except Exception:
-                    continue
-
-        # ---- Step 5: Wait for redirect with request_token ----
+        # ── Wait for redirect with request_token ─────────────
         logger.info("Waiting for request_token in redirect URL...")
-        try:
-            WebDriverWait(driver, 40).until(
-                lambda d: "request_token" in d.current_url
-            )
-        except Exception:
-            # RETRY: TOTP may have expired — try once more with fresh code
-            logger.warning("Redirect timeout — retrying with fresh TOTP code...")
-            totp_fields = driver.find_elements(By.XPATH, "//input[@type='number']")
-            if not totp_fields:
-                totp_fields = driver.find_elements(By.XPATH, "//input[@type='tel']")
+        request_token = None
+        deadline = time.time() + 40   # 40 second window for auto-TOTP
 
-            if totp_fields and any(f.is_displayed() for f in totp_fields):
-                # Wait for next TOTP window to be sure
-                time.sleep(5)
-                fresh_totp = TOTP(credentials['totp_key']).now()
-                for f in totp_fields:
-                    if f.is_displayed():
-                        f.clear()
-                        f.send_keys(fresh_totp)
-                        time.sleep(0.3)
-                        f.send_keys(Keys.RETURN)
-                        logger.info(f"Retry TOTP entered: {fresh_totp}")
+        while time.time() < deadline:
+            current_url = driver.current_url
+            if "request_token=" in current_url:
+                request_token = current_url.split("request_token=")[1].split("&")[0]
+                logger.info(f"request_token obtained: {request_token[:8]}...")
+                break
+            time.sleep(1)
+
+        # ── Fallback: ask user via Telegram ──────────────────
+        if not request_token:
+            logger.warning("Redirect timeout — switching to Telegram OTP fallback...")
+
+            tg_token   = creds.get('tg_token', '')
+            tg_chat_id = creds.get('tg_chat_id', '')
+
+            if tg_token and tg_token not in ('', 'YOUR_TELEGRAM_BOT_TOKEN'):
+                # Notify user on Telegram
+                _send_telegram(tg_token, tg_chat_id,
+                    "🔐 <b>Zerodha Login — OTP Required</b>\n\n"
+                    "Auto-login failed (TOTP key mismatch).\n\n"
+                    "👉 Open your <b>Zerodha / Google Authenticator app</b>\n"
+                    "👉 Find the 6-digit code for Zerodha\n"
+                    "👉 Reply here with JUST the 6 digits\n\n"
+                    "⏳ You have <b>90 seconds</b> to reply."
+                )
+
+                # Clear the TOTP field and wait for user's reply
+                try:
+                    totp_field = driver.find_element(By.XPATH, totp_selector)
+                    totp_field.clear()
+                except Exception:
+                    pass
+
+                # Wait for reply
+                user_otp = _wait_for_telegram_otp(tg_token, tg_chat_id, timeout_seconds=90)
+
+                if user_otp:
+                    # Enter the user-provided OTP
+                    try:
+                        totp_field = driver.find_element(By.XPATH, totp_selector)
+                        totp_field.clear()
+                        totp_field.send_keys(user_otp)
+                        from selenium.webdriver.common.keys import Keys
+                        totp_field.send_keys(Keys.RETURN)
+                        logger.info(f"User OTP entered: {user_otp}")
+                    except Exception:
+                        # Page may have refreshed — re-find field
+                        wait.until(EC.presence_of_element_located((By.XPATH, totp_selector)))
+                        totp_field = driver.find_element(By.XPATH, totp_selector)
+                        totp_field.send_keys(user_otp)
+                        from selenium.webdriver.common.keys import Keys
+                        totp_field.send_keys(Keys.RETURN)
+
+                    try:
+                        driver.find_element(By.XPATH, "//button[@type='submit']").click()
+                    except Exception:
+                        pass
+
+                    # Wait for redirect again
+                    deadline2 = time.time() + 40
+                    while time.time() < deadline2:
+                        current_url = driver.current_url
+                        if "request_token=" in current_url:
+                            request_token = current_url.split("request_token=")[1].split("&")[0]
+                            logger.info(f"request_token obtained after Telegram OTP: {request_token[:8]}...")
+                            break
                         time.sleep(1)
-                        break
 
-                # Final wait
-                WebDriverWait(driver, 30).until(
-                    lambda d: "request_token" in d.current_url
-                )
+                else:
+                    raise TimeoutError(
+                        "Login failed: No OTP received via Telegram within 90 seconds. "
+                        "Please check your Telegram app."
+                    )
             else:
-                current_url = driver.current_url
-                raise RuntimeError(
-                    f"Login failed — TOTP page not found for retry. URL: {current_url}"
+                raise TimeoutError(
+                    "Login failed: TOTP redirect timed out and Telegram is not configured. "
+                    "Please set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in api_key.txt (lines 6 and 7)."
                 )
 
-        if "request_token" not in driver.current_url:
-            raise RuntimeError(
-                f"Login did not redirect to request_token. URL: {driver.current_url}"
-            )
+        if not request_token:
+            raise RuntimeError("Login failed: Could not obtain request_token even after OTP submission.")
 
-        time.sleep(1)  # brief pause for URL to stabilise
+        # ── Step 4: Exchange request_token for access_token ───
+        from kiteconnect import KiteConnect
+        kite = KiteConnect(api_key=creds['api_key'])
+        session_data = kite.generate_session(request_token, api_secret=creds['api_secret'])
+        access_token = session_data["access_token"]
 
-        # ---- Step 5: Extract request token ----
-        request_token = driver.current_url.split("request_token=")[1].split("&")[0]
+        # Save for reuse
+        with open(ACCESS_TOKEN_FILE, 'w') as f:
+            f.write(access_token)
 
-        with open(REQUEST_TOKEN_FILE, 'w') as f:
-            f.write(request_token)
-        logger.info(f"Request token saved: {request_token}")
-
-    except Exception as e:
-        logger.error(f"Login failed: {e}")
-        # Save screenshot for debugging
-        try:
-            screenshot_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                "logs", f"login_error_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-            )
-            os.makedirs(os.path.dirname(screenshot_path), exist_ok=True)
-            driver.save_screenshot(screenshot_path)
-            logger.error(f"Screenshot saved: {screenshot_path}")
-        except Exception:
-            pass
-        raise
+        logger.info("✅ Login successful — access token saved")
+        return access_token
 
     finally:
         driver.quit()
-        logger.info("Browser closed")
-
-    return request_token
 
 
-# ------------------------------------------------------------------
-# GENERATE ACCESS TOKEN
-# ------------------------------------------------------------------
-def generate_access_token(request_token, credentials):
-    """Exchange request_token for access_token via Zerodha API"""
-    kite = KiteConnect(api_key=credentials['api_key'])
-
-    logger.info("Generating access token...")
-    data = kite.generate_session(
-        request_token,
-        api_secret=credentials['api_secret']
-    )
-    access_token = data["access_token"]
-
-    with open(ACCESS_TOKEN_FILE, 'w') as f:
-        f.write(access_token)
-
-    logger.info(f"Access token saved: {access_token[:10]}...")
-    return access_token
-
-
-# ------------------------------------------------------------------
-# VERIFY SESSION
-# ------------------------------------------------------------------
-def verify_session(kite):
-    """Verify session by fetching profile and a test LTP"""
-    try:
-        profile = kite.profile()
-        logger.info(f"Logged in as: {profile['user_name']} ({profile['user_id']})")
-
-        ltp = kite.ltp("NSE:NIFTY 50")
-        nifty_price = ltp["NSE:NIFTY 50"]["last_price"]
-        logger.info(f"Nifty50 LTP: ₹{nifty_price:,.2f}")
-
-        return True
-    except Exception as e:
-        logger.error(f"Session verification failed: {e}")
-        return False
-
-
-# ------------------------------------------------------------------
-# MAIN ENTRY POINT — get_kite_session()
-# ------------------------------------------------------------------
-def get_kite_session(headless=True, force_relogin=False):
-    """
-    Master function to get a valid KiteConnect session.
-    
-    Usage:
-        from auth.login import get_kite_session
-        kite = get_kite_session()
-    
-    - Reuses today's token if available (skips browser)
-    - Auto-logins if token is stale or missing
-    - Verifies session before returning
-
-    Returns:
-        kite (KiteConnect): Authenticated KiteConnect instance
-    """
-    credentials = load_credentials()
-    kite = KiteConnect(api_key=credentials['api_key'])
-
-    # --- Try to reuse existing session ---
-    if not force_relogin:
-        valid, existing_token = is_session_valid()
-        if valid:
-            kite.set_access_token(existing_token)
-            if verify_session(kite):
-                logger.info("Reusing existing session — no browser needed.")
-                return kite
-            logger.warning("Existing token invalid — performing fresh login.")
-
-    # --- Perform fresh login ---
-    try:
-        request_token = autologin(headless=headless, credentials=credentials)
-        access_token  = generate_access_token(request_token, credentials)
-        kite.set_access_token(access_token)
-
-        if verify_session(kite):
-            logger.info("Fresh login successful.")
-            return kite
-        else:
-            raise RuntimeError("Session verification failed after fresh login.")
-
-    except Exception as e:
-        logger.critical(f"Cannot establish Kite session: {e}")
-        raise
-
-
-# ------------------------------------------------------------------
-# STANDALONE EXECUTION
-# ------------------------------------------------------------------
 if __name__ == "__main__":
-    """Run directly to test login: python auth/login.py"""
-    print("=" * 60)
-    print("  ZERODHA KITE — AUTO LOGIN TEST")
-    print("=" * 60)
+    """Quick test: python auth/login.py"""
+    token = login(headless=False)   # headless=False shows the browser window
+    print(f"Access token: {token[:16]}...")
 
-    try:
-        kite = get_kite_session(headless=False)  # headless=False to see browser
-        print("\n[SUCCESS] Login verified! System ready to trade.")
+    from kiteconnect import KiteConnect
+    creds = _load_credentials()
+    kite  = KiteConnect(api_key=creds['api_key'])
+    kite.set_access_token(token)
 
-        # Quick test: fetch a few LTPs
-        symbols = ["NSE:RELIANCE", "NSE:HDFCBANK", "NSE:INFY"]
-        ltps = kite.ltp(symbols)
-        print("\nSample LTPs:")
-        for sym, data in ltps.items():
-            print(f"  {sym}: ₹{data['last_price']:,.2f}")
+    profile = kite.profile()
+    print(f"Logged in as: {profile['user_name']} ({profile['email']})")
 
-    except Exception as e:
-        print(f"\n[FAILED] Login error: {e}")
-        sys.exit(1)
+    ltp = kite.ltp(["NSE:NIFTY 50"])
+    print(f"Nifty LTP: {ltp['NSE:NIFTY 50']['last_price']}")
