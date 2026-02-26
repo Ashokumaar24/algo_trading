@@ -7,6 +7,7 @@
 from kiteconnect import KiteConnect
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from pyotp import TOTP
@@ -128,18 +129,126 @@ def autologin(headless=True, credentials=None):
 
         # ---- Step 3: TOTP ----
         logger.info("Waiting for TOTP field...")
-        otp_input = wait.until(
-            EC.presence_of_element_located(
-                (By.XPATH, "//input[@type='password' or @type='tel']")
-            )
-        )
+
+        # Try multiple selectors — Zerodha sometimes changes field type
+        otp_input = None
+        totp_selectors = [
+            (By.XPATH, "//input[@id='userid']/../../..//input[@type='number']"),
+            (By.XPATH, "//input[@type='number']"),
+            (By.XPATH, "//input[@label='External TOTP']"),
+            (By.XPATH, "//input[@autocomplete='one-time-code']"),
+            (By.XPATH, "//input[contains(@placeholder,'TOTP') or contains(@placeholder,'PIN') or contains(@placeholder,'OTP')]"),
+            (By.XPATH, "//input[@type='tel']"),
+            (By.XPATH, "//input[@type='password' and not(@id='password')]"),
+        ]
+
+        for selector in totp_selectors:
+            try:
+                otp_input = WebDriverWait(driver, 5).until(
+                    EC.presence_of_element_located(selector)
+                )
+                logger.info(f"TOTP field found with selector: {selector[1]}")
+                break
+            except Exception:
+                continue
+
+        if otp_input is None:
+            # Last resort: any input that appeared after login submit
+            time.sleep(2)
+            inputs = driver.find_elements(By.TAG_NAME, "input")
+            visible = [el for el in inputs if el.is_displayed() and el.get_attribute("id") != "userid"]
+            if visible:
+                otp_input = visible[-1]
+                logger.info(f"TOTP field found via fallback (visible input): id={otp_input.get_attribute('id')}")
+            else:
+                logger.error("Could not find TOTP input field")
+                driver.save_screenshot(os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    "logs", f"totp_not_found_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                ))
+                raise RuntimeError("TOTP input field not found on page")
+
+        # ---- Wait for TOTP code with enough validity remaining ----
+        # TOTP resets every 30s — if <5s left, wait for fresh window
+        remaining = 30 - (int(time.time()) % 30)
+        if remaining <= 5:
+            logger.info(f"TOTP almost expired ({remaining}s left) — waiting {remaining + 2}s...")
+            time.sleep(remaining + 2)
+
         totp = TOTP(credentials['totp_key']).now()
+        otp_input.click()
+        time.sleep(0.2)
+        otp_input.clear()
         otp_input.send_keys(totp)
         logger.info(f"TOTP entered: {totp}")
+        time.sleep(0.3)
 
-        # ---- Step 4: Wait for redirect with request_token ----
+        # ---- Step 4: Submit TOTP ----
+        # PRIMARY: Press ENTER — most reliable across all Zerodha UI versions
+        otp_input.send_keys(Keys.RETURN)
+        logger.info("TOTP submitted via ENTER key")
+        time.sleep(1)
+
+        # SECONDARY: Also click submit button if still on TOTP page
+        if "request_token" not in driver.current_url:
+            for btn_xpath in [
+                "//button[@type='submit']",
+                "//button[contains(text(),'Continue')]",
+                "//button[contains(text(),'Login')]",
+                "//button[contains(text(),'Verify')]",
+            ]:
+                try:
+                    btn = driver.find_element(By.XPATH, btn_xpath)
+                    if btn.is_displayed() and btn.is_enabled():
+                        btn.click()
+                        logger.info(f"TOTP submit button clicked")
+                        time.sleep(1)
+                        break
+                except Exception:
+                    continue
+
+        # ---- Step 5: Wait for redirect with request_token ----
         logger.info("Waiting for request_token in redirect URL...")
-        wait.until(lambda d: "request_token" in d.current_url)
+        try:
+            WebDriverWait(driver, 40).until(
+                lambda d: "request_token" in d.current_url
+            )
+        except Exception:
+            # RETRY: TOTP may have expired — try once more with fresh code
+            logger.warning("Redirect timeout — retrying with fresh TOTP code...")
+            totp_fields = driver.find_elements(By.XPATH, "//input[@type='number']")
+            if not totp_fields:
+                totp_fields = driver.find_elements(By.XPATH, "//input[@type='tel']")
+
+            if totp_fields and any(f.is_displayed() for f in totp_fields):
+                # Wait for next TOTP window to be sure
+                time.sleep(5)
+                fresh_totp = TOTP(credentials['totp_key']).now()
+                for f in totp_fields:
+                    if f.is_displayed():
+                        f.clear()
+                        f.send_keys(fresh_totp)
+                        time.sleep(0.3)
+                        f.send_keys(Keys.RETURN)
+                        logger.info(f"Retry TOTP entered: {fresh_totp}")
+                        time.sleep(1)
+                        break
+
+                # Final wait
+                WebDriverWait(driver, 30).until(
+                    lambda d: "request_token" in d.current_url
+                )
+            else:
+                current_url = driver.current_url
+                raise RuntimeError(
+                    f"Login failed — TOTP page not found for retry. URL: {current_url}"
+                )
+
+        if "request_token" not in driver.current_url:
+            raise RuntimeError(
+                f"Login did not redirect to request_token. URL: {driver.current_url}"
+            )
+
         time.sleep(1)  # brief pause for URL to stabilise
 
         # ---- Step 5: Extract request token ----
