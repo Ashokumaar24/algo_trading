@@ -11,11 +11,9 @@ Run:  python setup_windows_task.py
 import os
 import sys
 import subprocess
-from pathlib import Path
 
 
 def find_python_exe():
-    """Find the exact Python executable path"""
     return sys.executable
 
 
@@ -23,9 +21,7 @@ def create_task():
     project_root = os.path.dirname(os.path.abspath(__file__))
     python_exe   = find_python_exe()
     script_path  = os.path.join(project_root, "auto_start.py")
-    log_path     = os.path.join(project_root, "logs", "autostart.log")
 
-    # Make sure logs folder exists
     os.makedirs(os.path.join(project_root, "logs"), exist_ok=True)
 
     print("=" * 60)
@@ -34,7 +30,6 @@ def create_task():
     print(f"\n  Project:    {project_root}")
     print(f"  Python:     {python_exe}")
     print(f"  Script:     {script_path}")
-    print(f"  Log file:   {log_path}")
     print(f"  Schedule:   8:55 AM, Monday–Friday\n")
 
     if not os.path.exists(script_path):
@@ -43,10 +38,7 @@ def create_task():
         input("\nPress Enter to exit...")
         return False
 
-    # ----------------------------------------------------------------
-    # Build the XML task definition
-    # Windows Task Scheduler accepts XML — most reliable method
-    # ----------------------------------------------------------------
+    # XML task definition — most reliable method for Task Scheduler
     task_xml = f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -103,17 +95,13 @@ def create_task():
   </Actions>
 </Task>"""
 
-    # Write XML to temp file
     xml_path = os.path.join(project_root, "logs", "task_temp.xml")
     with open(xml_path, 'w', encoding='utf-16') as f:
         f.write(task_xml)
 
-    # ----------------------------------------------------------------
-    # Register the task using schtasks.exe
-    # ----------------------------------------------------------------
     task_name = "AlgoTrading_AutoStart"
 
-    # Delete old task if exists (ignore error if not found)
+    # Delete old task if it exists
     subprocess.run(
         ["schtasks", "/Delete", "/TN", task_name, "/F"],
         capture_output=True
@@ -125,7 +113,6 @@ def create_task():
         capture_output=True, text=True
     )
 
-    # Clean up temp XML
     try:
         os.remove(xml_path)
     except Exception:
@@ -137,13 +124,11 @@ def create_task():
         print(f"  Runs at:    8:55 AM every Monday–Friday")
         print(f"  Starts on:  Next weekday automatically\n")
 
-        # Verify it's there
         verify = subprocess.run(
             ["schtasks", "/Query", "/TN", task_name, "/FO", "LIST"],
             capture_output=True, text=True
         )
         if verify.returncode == 0:
-            # Print relevant lines only
             for line in verify.stdout.splitlines():
                 if any(k in line for k in ["Task Name", "Status", "Next Run", "Last Run"]):
                     print(f"  {line.strip()}")
@@ -152,14 +137,13 @@ def create_task():
     else:
         print(f"  ❌ Task creation failed.")
         print(f"  Error: {result.stderr.strip()}")
-        print(f"\n  Try running this script as Administrator:")
+        print(f"\n  Try running as Administrator:")
         print(f"  Right-click Command Prompt → 'Run as administrator'")
         print(f"  Then run: python setup_windows_task.py")
         return False
 
 
 def test_task():
-    """Run the task immediately to verify it works"""
     task_name = "AlgoTrading_AutoStart"
     print("\n  Running task now to test...")
     result = subprocess.run(
@@ -167,13 +151,12 @@ def test_task():
         capture_output=True, text=True
     )
     if result.returncode == 0:
-        print("  ✅ Task started successfully — check Telegram for startup message!")
+        print("  ✅ Task started — check Telegram for startup message!")
     else:
         print(f"  ⚠️  Could not start task: {result.stderr.strip()}")
 
 
 def delete_task():
-    """Remove the scheduled task"""
     task_name = "AlgoTrading_AutoStart"
     result = subprocess.run(
         ["schtasks", "/Delete", "/TN", task_name, "/F"],
@@ -198,12 +181,6 @@ def show_menu():
 
 
 if __name__ == "__main__":
-    # If run with --create flag, just create without menu
-    if "--create" in sys.argv:
-        create_task()
-        input("\nPress Enter to exit...")
-        sys.exit()
-
     while True:
         choice = show_menu()
 

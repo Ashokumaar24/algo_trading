@@ -29,7 +29,6 @@
 
 import requests
 import os
-import json
 import time
 import threading
 from datetime import datetime
@@ -67,9 +66,10 @@ class TelegramNotifier:
         self.chat_id = None
         self.enabled = False
 
-        self._stop_requested  = False   # set by /stop command
+        self._stop_requested  = False
         self._last_update_id  = 0
         self._command_thread: Optional[threading.Thread] = None
+        self._trading_system  = None
 
         self._load_credentials()
 
@@ -83,7 +83,6 @@ class TelegramNotifier:
             with open(cred_file, 'r') as f:
                 lines = [l.strip() for l in f.readlines()]
 
-            # Lines 6 and 7 (index 5 and 6) = Telegram credentials
             if len(lines) >= 7:
                 token   = lines[5]
                 chat_id = lines[6]
@@ -102,7 +101,7 @@ class TelegramNotifier:
             self.enabled = False
 
     # ------------------------------------------------------------------
-    # CORE SEND METHOD
+    # CORE SEND METHODS
     # ------------------------------------------------------------------
     def send(self, message: str, parse_mode: str = "HTML") -> bool:
         """Send a message to your Telegram chat"""
@@ -137,7 +136,7 @@ class TelegramNotifier:
             return False
 
     # ------------------------------------------------------------------
-    # COMMAND LISTENER (runs in background thread)
+    # COMMAND LISTENER (background thread)
     # ------------------------------------------------------------------
     def start_command_listener(self, trading_system=None):
         """Start background thread to listen for /stop /status /resume commands"""
@@ -161,8 +160,7 @@ class TelegramNotifier:
                 }, timeout=15)
 
                 if resp.status_code == 200:
-                    data = resp.json()
-                    for update in data.get("result", []):
+                    for update in resp.json().get("result", []):
                         self._last_update_id = update["update_id"]
                         self._handle_update(update)
 
@@ -176,7 +174,6 @@ class TelegramNotifier:
         text = msg.get("text", "").strip().lower()
         chat = str(msg.get("chat", {}).get("id", ""))
 
-        # Only respond to your own chat
         if chat != str(self.chat_id):
             return
 
@@ -184,7 +181,9 @@ class TelegramNotifier:
 
         if text == "/stop":
             self._stop_requested = True
-            self.send("🛑 <b>EMERGENCY STOP activated.</b>\nNo new trades will be placed.\nExisting positions will still be monitored and closed at 3:15 PM.\nSend /resume to re-enable.")
+            self.send("🛑 <b>EMERGENCY STOP activated.</b>\nNo new trades will be placed.\n"
+                      "Existing positions will still be monitored and closed at 3:15 PM.\n"
+                      "Send /resume to re-enable.")
 
         elif text == "/resume":
             self._stop_requested = False
@@ -207,7 +206,6 @@ class TelegramNotifier:
             )
 
     def _send_status(self):
-        """Send current system status"""
         try:
             if self._trading_system:
                 status = self._trading_system.risk_manager.get_status()
@@ -215,24 +213,24 @@ class TelegramNotifier:
                 self.send(
                     f"📊 <b>System Status</b>\n\n"
                     f"Mode: {stop_status}\n"
-                    f"Trades today: {status['trades_today']}/{2}\n"
+                    f"Trades today: {status['trades_today']}/2\n"
                     f"Open positions: {status['open_positions']}\n"
                     f"Daily P&amp;L: ₹{status['daily_pnl']:+,.0f}\n"
                     f"Consecutive losses: {status['consecutive_losses']}\n"
                     f"Can trade: {'Yes ✅' if status['can_trade'] and not self._stop_requested else 'No 🚫'}"
                 )
+            else:
+                self.send("⚠️ Trading system not yet initialised.")
         except Exception as e:
             self.send(f"⚠️ Status error: {e}")
 
     def _send_current_journal(self):
-        """Send today's journal file"""
         try:
             from utils.daily_journal import get_journal
             journal = get_journal()
             if os.path.exists(journal.report_path):
                 self.send_document(journal.report_path, caption="📓 Today's trading journal")
             else:
-                # Generate it now
                 path = journal.generate_report()
                 self.send_document(path, caption="📓 Journal generated on demand")
         except Exception as e:
@@ -244,7 +242,6 @@ class TelegramNotifier:
     # ------------------------------------------------------------------
     # TRADING EVENT NOTIFICATIONS
     # ------------------------------------------------------------------
-
     def notify_startup(self, dry_run: bool = True):
         mode = "📄 PAPER TRADE (dry-run)" if dry_run else "💰 LIVE TRADING"
         self.send(
@@ -349,7 +346,7 @@ class TelegramNotifier:
 
     def notify_eod_summary(self, status: dict, journal_path: str = None,
                             dry_run: bool = True):
-        mode = "Paper Trade" if dry_run else "Live Trade"
+        mode  = "Paper Trade" if dry_run else "Live Trade"
         wins  = status.get('wins', 0)
         losses = status.get('losses', 0)
         total  = wins + losses
@@ -367,7 +364,6 @@ class TelegramNotifier:
             f"Journal saved to logs/ ✅"
         )
 
-        # Send the journal file
         if journal_path and os.path.exists(journal_path):
             time.sleep(1)
             self.send_document(journal_path, caption=f"📓 Full journal — {datetime.now().strftime('%d %b %Y')}")

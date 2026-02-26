@@ -272,7 +272,7 @@ def login(headless: bool = True) -> str:
 
 
 # ----------------------------------------------------------------
-# PUBLIC API — called by main.py, auth/__init__.py, backtests
+# PUBLIC API — used by main.py, backtests, scanner
 # ----------------------------------------------------------------
 def get_kite_session(headless: bool = True):
     """Login and return an authenticated KiteConnect instance."""
