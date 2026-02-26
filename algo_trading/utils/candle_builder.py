@@ -2,6 +2,11 @@
 #  utils/candle_builder.py
 #  Builds 5-minute OHLCV candles from real-time KiteTicker ticks
 #  Fires on_candle_close callback on every completed candle
+#
+#  FIX: _get_candle_start formula was completely broken.
+#       Original used `self.interval.seconds * 60` which caused
+#       every tick to map to the 9:15 candle all morning.
+#       Corrected to use `self.interval.seconds // 60` (interval in minutes).
 # ============================================================
 
 import pandas as pd
@@ -61,22 +66,34 @@ class CandleBuilder:
     """
 
     def __init__(self, interval_minutes: int = 5):
-        self.interval   = timedelta(minutes=interval_minutes)
-        self.open_candles: Dict[str, Candle]          = {}
-        self.candle_start: Dict[str, datetime]        = {}
-        self.history: Dict[str, list]                 = defaultdict(list)
-        self.cumulative_volume: Dict[str, float]      = defaultdict(float)
-        self._callback: Optional[Callable]            = None
+        self.interval_minutes = interval_minutes                  # FIX: store as int directly
+        self.interval         = timedelta(minutes=interval_minutes)
+        self.open_candles: Dict[str, Candle]     = {}
+        self.candle_start: Dict[str, datetime]   = {}
+        self.history: Dict[str, list]            = defaultdict(list)
+        self.cumulative_volume: Dict[str, float] = defaultdict(float)
+        self._callback: Optional[Callable]       = None
 
     def set_callback(self, callback: Callable):
         """Register the function to call when a candle closes"""
         self._callback = callback
 
     def _get_candle_start(self, tick_time: datetime) -> datetime:
-        """Snap tick time back to the start of its candle period"""
+        """
+        Snap tick time back to the start of its candle period.
+
+        FIX: Original formula was:
+             period_index = minutes_since_open // self.interval.seconds * 60
+             which equals  (minutes_since_open // 300) * 60
+             giving 0 for all ticks before 2:15 PM (300 minutes after open).
+
+        Correct formula:
+             period_index = minutes_since_open // interval_minutes
+        """
         minutes_since_open = (tick_time.hour * 60 + tick_time.minute) - (9 * 60 + 15)
-        period_index = minutes_since_open // self.interval.seconds * 60
-        snap_minutes = 9 * 60 + 15 + period_index * (self.interval.seconds // 60)
+        # FIX: use interval_minutes (int), not interval.seconds
+        period_index = minutes_since_open // self.interval_minutes
+        snap_minutes = 9 * 60 + 15 + period_index * self.interval_minutes
         return tick_time.replace(
             hour=snap_minutes // 60,
             minute=snap_minutes % 60,
@@ -102,7 +119,6 @@ class CandleBuilder:
             tick_time = datetime.fromisoformat(tick_time)
 
         candle_start = self._get_candle_start(tick_time)
-        candle_end   = candle_start + self.interval
 
         # --- New candle period: close previous, open new ---
         if symbol in self.candle_start and self.candle_start[symbol] < candle_start:
@@ -113,15 +129,15 @@ class CandleBuilder:
             prev_volume = self.cumulative_volume.get(symbol, 0)
             tick_volume = volume - prev_volume if volume > prev_volume else 0
 
-            self.open_candles[symbol]    = Candle(
+            self.open_candles[symbol]      = Candle(
                 symbol, candle_start, price, price, price, price, tick_volume, oi
             )
-            self.candle_start[symbol]   = candle_start
+            self.candle_start[symbol]      = candle_start
             self.cumulative_volume[symbol] = volume
 
         else:
             # --- Update existing candle ---
-            candle = self.open_candles[symbol]
+            candle   = self.open_candles[symbol]
             prev_vol = self.cumulative_volume[symbol]
             tick_vol = volume - prev_vol if volume > prev_vol else 0
 

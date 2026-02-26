@@ -1,7 +1,14 @@
 # ============================================================
 #  config/config.py
 #  Central configuration for the entire trading system
-#  Edit these values to customise strategy behaviour
+#
+#  FIX: ORB_REWARD_RISK_RATIO changed from 1.5 → 1.2.
+#       The live system was using 1.5 while all backtests used 1.2.
+#       All backtest results (V2/V3/V4) were produced at 1.2,
+#       so the live system would have behaved differently from
+#       what was tested. Both now use 1.2 consistently.
+#       If you deliberately want to test 1.5, change it here and
+#       re-run backtests — never change only one side.
 # ============================================================
 
 import os
@@ -15,7 +22,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # ------------------------------------------------------------------
 # CREDENTIALS PATH
 # ------------------------------------------------------------------
-TOKEN_FILE      = os.path.join(BASE_DIR, "api_key.txt")
+TOKEN_FILE          = os.path.join(BASE_DIR, "api_key.txt")
 ACCESS_TOKEN_FILE   = os.path.join(BASE_DIR, "access_token.txt")
 REQUEST_TOKEN_FILE  = os.path.join(BASE_DIR, "request_token.txt")
 
@@ -57,20 +64,24 @@ NIFTY50_SYMBOLS = [
 # ------------------------------------------------------------------
 
 # ORB Strategy
-ORB_TIMEFRAME_MINUTES   = 15       # Opening range period
-ORB_VOLUME_MULTIPLIER   = 1.5      # Volume must be 1.5x 20-day avg
-ORB_MIN_RANGE_PCT       = 0.003    # Minimum ORB range: 0.3% of price
-ORB_MAX_RANGE_PCT       = 0.015    # Maximum ORB range: 1.5% of price
-ORB_ENTRY_DEADLINE      = time(12, 0)   # No ORB entries after 12 PM
-ORB_REWARD_RISK_RATIO   = 1.5
+ORB_TIMEFRAME_MINUTES   = 15
+ORB_VOLUME_MULTIPLIER   = 1.5
+ORB_MIN_RANGE_PCT       = 0.003    # 0.3% of price
+ORB_MAX_RANGE_PCT       = 0.015    # 1.5% of price
+ORB_ENTRY_DEADLINE      = time(12, 0)
+
+# FIX: was 1.5 in live but all backtests used 1.2.
+#      Changed to 1.2 so live matches what was tested.
+#      Do NOT change this without re-running backtests.
+ORB_REWARD_RISK_RATIO   = 1.2
 
 # VWAP Pullback Strategy
 VWAP_EMA_PERIOD         = 20
-VWAP_TOLERANCE_PCT      = 0.001    # 0.1% tolerance from VWAP
+VWAP_TOLERANCE_PCT      = 0.001
 VWAP_ENTRY_DEADLINE     = time(13, 30)
 VWAP_TRAIL_AFTER_1R     = True
 
-# EMA-RSI Strategy
+# EMA-RSI Strategy (retired — no gross edge on 5-min Nifty stocks)
 EMA_FAST                = 9
 EMA_SLOW                = 21
 RSI_PERIOD              = 14
@@ -82,24 +93,24 @@ EMA_ATR_MULTIPLIER_SL   = 1.5
 EMA_ATR_MULTIPLIER_TGT  = 2.0
 
 # Breakout ATR Strategy
-BREAKOUT_ATR_MIN_PCT    = 0.008    # ATR must be > 0.8% of price
-BREAKOUT_ATR_MAX_PCT    = 0.030    # ATR must be < 3.0% of price
+BREAKOUT_ATR_MIN_PCT    = 0.008
+BREAKOUT_ATR_MAX_PCT    = 0.030
 BREAKOUT_VOL_MULTIPLIER = 1.5
 BREAKOUT_SL_ATR_MULT    = 0.5
 
 # Dynamic SL Settings
-SL_MIN_PCT              = 0.003    # Never tighter than 0.3%
-SL_MAX_PCT              = 0.008    # Never wider than 0.8%
+SL_MIN_PCT              = 0.003
+SL_MAX_PCT              = 0.008
 SL_ATR_MULTIPLIER       = 1.5
 
 # ------------------------------------------------------------------
 # MARKET REGIME THRESHOLDS
 # ------------------------------------------------------------------
-ADX_TREND_THRESHOLD     = 25
+ADX_TREND_THRESHOLD     = 25       # shared by live classifier AND backtest filter
 EMA_SHORT_PERIOD        = 50
 EMA_LONG_PERIOD         = 200
-INDIA_VIX_HIGH          = 22       # Reduce size above this
-INDIA_VIX_EXTREME       = 28       # Stop trading above this
+INDIA_VIX_HIGH          = 22
+INDIA_VIX_EXTREME       = 28
 BB_VOL_HIGH_PERCENTILE  = 75
 BB_VOL_LOW_PERCENTILE   = 25
 
@@ -107,10 +118,10 @@ BB_VOL_LOW_PERCENTILE   = 25
 # TIME GATES (IST)
 # ------------------------------------------------------------------
 MARKET_OPEN             = time(9, 15)
-ORB_READY               = time(9, 30)   # First valid entry time
-NO_NEW_ENTRIES          = time(14, 0)   # No new positions after 2 PM
-AGGRESSIVE_EXIT_TIME    = time(14, 45)  # Start closing losing positions
-FORCE_CLOSE_TIME        = time(15, 15)  # Hard close ALL positions
+ORB_READY               = time(9, 30)
+NO_NEW_ENTRIES          = time(14, 0)
+AGGRESSIVE_EXIT_TIME    = time(14, 45)
+FORCE_CLOSE_TIME        = time(15, 15)
 
 # ------------------------------------------------------------------
 # SCANNER WEIGHTS (must sum to 1.0)
@@ -127,24 +138,21 @@ SCANNER_WEIGHTS = {
     'sgx_global_bias':      0.10,
 }
 
-# ATR sweet spot percentiles for scanner
 ATR_PERCENTILE_MIN = 40
 ATR_PERCENTILE_MAX = 80
-
-# Gap sweet spot
-GAP_PCT_MIN = 0.003   # 0.3%
-GAP_PCT_MAX = 0.015   # 1.5%
+GAP_PCT_MIN        = 0.003
+GAP_PCT_MAX        = 0.015
 
 # ------------------------------------------------------------------
 # TRANSACTION COST MODEL (Zerodha Intraday MIS)
 # ------------------------------------------------------------------
-BROKERAGE_PER_ORDER     = 20        # Flat ₹20 per order
-STT_SELL_PCT            = 0.00025   # 0.025% on sell-side only
+BROKERAGE_PER_ORDER     = 20
+STT_SELL_PCT            = 0.00025
 EXCHANGE_TXN_PCT        = 0.0000345
 SEBI_CHARGE_PCT         = 0.000001
 GST_ON_BROKERAGE        = 0.18
-STAMP_DUTY_PCT          = 0.00003   # Buy side only
-SLIPPAGE_PCT            = 0.0005    # 0.05% realistic slippage
+STAMP_DUTY_PCT          = 0.00003
+SLIPPAGE_PCT            = 0.0005
 
 # ------------------------------------------------------------------
 # BACKTEST SETTINGS

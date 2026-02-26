@@ -1,7 +1,12 @@
 # ============================================================
 #  strategies/ai_hybrid.py
 #  AI Hybrid Strategy — Regime-aware meta-strategy selector
-#  Dynamically picks the best strategy for current conditions
+#
+#  FIX: EMA_RSI strategy was instantiated in __init__ but is
+#       never present in REGIME_STRATEGY_MAP and was marked
+#       as "retired" after backtests showed no gross edge.
+#       Removed instantiation to eliminate dead code and
+#       unnecessary memory + import overhead.
 # ============================================================
 
 import pandas as pd
@@ -11,7 +16,6 @@ from typing import Optional, List
 from strategies.base_strategy import Signal
 from strategies.orb_strategy import ORBStrategy
 from strategies.vwap_pullback import VWAPPullbackStrategy
-from strategies.ema_rsi_strategy import EMARSIStrategy
 from strategies.breakout_atr import BreakoutATRStrategy
 from regime.market_regime import MarketRegimeClassifier, MarketRegime
 from utils.logger import get_logger
@@ -31,27 +35,19 @@ class AIHybridStrategy:
     Layer 5: Best signal selection by confidence score
     Layer 6: Dynamic position sizing via RiskManager
 
-    This is the ONLY strategy class the main system interacts with.
-    It orchestrates all sub-strategies internally.
+    Active strategies: ORB_15, VWAP_PULLBACK, BREAKOUT_ATR
+    Retired:           EMA_RSI (no gross edge on 5-min Nifty data)
     """
 
-    # Strategy registry
-    STRATEGY_NAMES = {
-        'ORB_15':        'orb',
-        'VWAP_PULLBACK': 'vwap',
-        'EMA_RSI':       'ema_rsi',
-        'BREAKOUT_ATR':  'breakout',
-    }
-
     def __init__(self):
-        # Initialise sub-strategies
+        # FIX: removed self.ema_rsi = EMARSIStrategy()
+        #      EMA_RSI has no gross edge and is not in REGIME_STRATEGY_MAP.
+        #      Keeping it instantiated was dead weight.
         self.orb      = ORBStrategy()
         self.vwap     = VWAPPullbackStrategy()
-        self.ema_rsi  = EMARSIStrategy()
         self.breakout = BreakoutATRStrategy()
 
         self.regime_classifier = MarketRegimeClassifier()
-
         self._current_regime: Optional[MarketRegime] = None
 
     # ------------------------------------------------------------------
@@ -67,19 +63,15 @@ class AIHybridStrategy:
             india_vix:     Today's India VIX reading
             prev_day_data: Dict {symbol: {high, low, close}} for Breakout strategy
         """
-        # Classify regime
         self._current_regime = self.regime_classifier.classify(
             nifty_daily, india_vix
         )
         logger.info(f"AI Hybrid Day Setup | {self._current_regime}")
 
-        # Reset all sub-strategies
         self.orb.reset_daily()
         self.vwap.reset_daily()
-        self.ema_rsi.reset_daily()
         self.breakout.reset_daily()
 
-        # Set previous day data for breakout strategy
         if prev_day_data:
             for symbol, data in prev_day_data.items():
                 self.breakout.set_prev_day_data(
@@ -94,56 +86,35 @@ class AIHybridStrategy:
     # MAIN SIGNAL GENERATION
     # ------------------------------------------------------------------
     def get_signal(self, symbol: str,
-                    candle: dict,
-                    candle_history: pd.DataFrame,
-                    avg_volume_20d: float,
-                    cum_volume_today: float,
-                    avg_daily_volume: float,
-                    sentiment_score: float = 0.0,
-                    nifty_5min: pd.DataFrame = None,
-                    india_vix: float = 0.0) -> Optional[Signal]:
-        """
-        Master signal generation method.
+                   candle: dict,
+                   candle_history: pd.DataFrame,
+                   avg_volume_20d: float,
+                   cum_volume_today: float,
+                   avg_daily_volume: float,
+                   sentiment_score: float = 0.0,
+                   nifty_5min: pd.DataFrame = None,
+                   india_vix: float = 0.0) -> Optional[Signal]:
 
-        Args:
-            symbol:           Stock symbol
-            candle:           Current completed 5-min candle
-            candle_history:   Historical 5-min candles DataFrame
-            avg_volume_20d:   20-day avg daily volume
-            cum_volume_today: Cumulative intraday volume today
-            avg_daily_volume: 20-day avg daily volume (for breakout)
-            sentiment_score:  NLP sentiment [-1 to +1]
-            nifty_5min:       Nifty 5-min data for intraday regime update
-            india_vix:        Current VIX reading
-
-        Returns:
-            Best Signal object or None
-        """
-        # --- Get/update regime ---
         regime = self._current_regime
         if regime is None:
             logger.warning("Regime not set — call setup_day() first")
             return None
 
-        # Optionally update intraday regime
         if nifty_5min is not None and len(nifty_5min) >= 20:
             regime = self.regime_classifier.classify_intraday(
                 nifty_5min, india_vix
             )
 
-        # --- Hard gate: not tradeable in this regime ---
         if not regime.is_tradeable:
             logger.info(f"AI Hybrid: No trade — regime not tradeable ({regime})")
             return None
 
-        # --- Get eligible strategies for this regime ---
         eligible_strategy_names = self.regime_classifier.get_eligible_strategies(regime)
 
         if not eligible_strategy_names:
             logger.info(f"AI Hybrid: No eligible strategies for {regime.key}")
             return None
 
-        # --- Sentiment gate ---
         eligible_strategy_names = self._apply_sentiment_gate(
             eligible_strategy_names, sentiment_score, regime
         )
@@ -152,7 +123,6 @@ class AIHybridStrategy:
             logger.info("AI Hybrid: All strategies blocked by sentiment gate")
             return None
 
-        # --- Collect signals from eligible strategies ---
         signals: List[Signal] = []
 
         prev_candle = None
@@ -173,7 +143,6 @@ class AIHybridStrategy:
         if not signals:
             return None
 
-        # --- Pick best signal (highest confidence) ---
         best_signal = max(signals, key=lambda s: s.confidence)
 
         logger.info(
@@ -187,11 +156,10 @@ class AIHybridStrategy:
     # STRATEGY DISPATCH
     # ------------------------------------------------------------------
     def _get_strategy_signal(self, strategy_name: str, symbol: str,
-                               candle: dict, candle_history: pd.DataFrame,
-                               avg_volume_20d: float, cum_volume_today: float,
-                               avg_daily_volume: float,
-                               prev_candle: Optional[dict]) -> Optional[Signal]:
-        """Dispatch signal check to the appropriate sub-strategy"""
+                              candle: dict, candle_history: pd.DataFrame,
+                              avg_volume_20d: float, cum_volume_today: float,
+                              avg_daily_volume: float,
+                              prev_candle: Optional[dict]) -> Optional[Signal]:
         try:
             if strategy_name == 'ORB_15':
                 return self.orb.check_entry(
@@ -201,15 +169,12 @@ class AIHybridStrategy:
                 return self.vwap.check_entry(
                     symbol, candle, candle_history, prev_candle
                 )
-            elif strategy_name == 'EMA_RSI':
-                return self.ema_rsi.check_entry(
-                    symbol, candle, candle_history
-                )
             elif strategy_name == 'BREAKOUT_ATR':
                 return self.breakout.check_entry(
                     symbol, candle, candle_history,
                     cum_volume_today, avg_daily_volume
                 )
+            # NOTE: EMA_RSI deliberately omitted — retired strategy
         except Exception as e:
             logger.error(f"Strategy error [{strategy_name}] {symbol}: {e}")
 
@@ -219,29 +184,17 @@ class AIHybridStrategy:
     # SENTIMENT GATE
     # ------------------------------------------------------------------
     def _apply_sentiment_gate(self, strategies: List[str],
-                                sentiment: float,
-                                regime: MarketRegime) -> List[str]:
-        """
-        Filter strategies based on sentiment.
-        Blocks trend-following longs on strongly negative sentiment
-        and trend-following shorts on strongly positive sentiment.
-        """
+                               sentiment: float,
+                               regime: MarketRegime) -> List[str]:
         filtered = []
         for s in strategies:
-            # Strong negative sentiment blocks VWAP long setups
             if sentiment < -0.35 and regime.trend == 'BULL' and s == 'VWAP_PULLBACK':
-                logger.debug(
-                    f"Sentiment gate: blocking {s} (sentiment={sentiment:.2f}, BULL regime)"
-                )
+                logger.debug(f"Sentiment gate: blocking {s} (sentiment={sentiment:.2f})")
                 continue
-            # Strong positive sentiment blocks VWAP short setups
             if sentiment > 0.35 and regime.trend == 'BEAR' and s == 'VWAP_PULLBACK':
-                logger.debug(
-                    f"Sentiment gate: blocking {s} (sentiment={sentiment:.2f}, BEAR regime)"
-                )
+                logger.debug(f"Sentiment gate: blocking {s} (sentiment={sentiment:.2f})")
                 continue
             filtered.append(s)
-
         return filtered
 
     # ------------------------------------------------------------------
@@ -250,7 +203,7 @@ class AIHybridStrategy:
     def get_status(self) -> dict:
         regime = self._current_regime
         return {
-            'regime':     str(regime) if regime else "Not set",
-            'tradeable':  regime.is_tradeable if regime else False,
-            'size_mult':  regime.size_multiplier if regime else 1.0,
+            'regime':    str(regime) if regime else "Not set",
+            'tradeable': regime.is_tradeable if regime else False,
+            'size_mult': regime.size_multiplier if regime else 1.0,
         }

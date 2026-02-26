@@ -1,10 +1,15 @@
 # ============================================================
 #  backtest/fetch_and_backtest_v4.py
-#  Backtest V4 — ORB_15 ONLY, confidence >= 90
+#  Backtest V4 — ORB_15 ONLY, confidence sweep
+#
+#  FIX: Removed misleading no-op monkey-patch:
+#       `engine.set_real_daily_data = lambda d: None`
+#       BacktestEngineV2 does not have set_real_daily_data.
+#       Real daily data is correctly passed via engine.run(..., daily_data=daily_data).
+#       The monkey-patch was doing nothing but hiding that fact.
 #
 #  This is the FINAL backtest before paper trading decision.
-#  Single change from V3: ORB min_confidence 80 → 90
-#  Goal: Reduce trades from 221 → ~70-90 to make Net PnL positive
+#  Goal: find the confidence threshold where ORB Net PnL turns positive.
 #
 #  Run: python backtest/fetch_and_backtest_v4.py
 # ============================================================
@@ -44,8 +49,8 @@ def fetch_data(kite, symbol, interval, days, chunk_days=60):
                 print("NO DATA"); return None
             df = pd.DataFrame(data)
         else:
-            all_data  = []
-            chunk_end = to_date
+            all_data    = []
+            chunk_end   = to_date
             chunk_start = max(from_date, chunk_end - timedelta(days=chunk_days))
             while chunk_end > from_date:
                 data = kite.historical_data(token, chunk_start, chunk_end, interval)
@@ -71,8 +76,11 @@ def fetch_data(kite, symbol, interval, days, chunk_days=60):
 
 def run_confidence_sweep(intraday_data, daily_data):
     """
-    Test ORB at confidence levels 80, 85, 90, 95
-    to find the sweet spot where Net PnL turns positive.
+    Test ORB at confidence levels 80, 85, 90, 92, 95.
+
+    NOTE: daily_data is passed directly to engine.run() via keyword arg.
+    BacktestEngineV2 accepts it and uses it for the regime filter,
+    overriding the default resampled fallback.
     """
     print("\n" + "=" * 70)
     print("  ORB CONFIDENCE SWEEP — Finding the profitable threshold")
@@ -89,19 +97,19 @@ def run_confidence_sweep(intraday_data, daily_data):
             apply_regime_filter=True,
             max_trades_per_day=2
         )
-        engine.set_real_daily_data = lambda d: None  # handled below
+        # FIX: pass real daily data directly — no monkey-patch needed
         m = engine.run(intraday_data, daily_data=daily_data)
 
         if "error" not in m:
             net  = m.get('total_net_pnl', 0)
             icon = "✅ POSITIVE!" if net > 0 else ("🟡 CLOSE" if net > -30000 else "")
             print(f"  conf≥{conf:>2}  "
-                  f"{m.get('total_trades',0):>8}  "
-                  f"{m.get('win_rate_pct',0):>8.1f}%  "
-                  f"₹{m.get('gross_pnl',0):>11,.0f}  "
-                  f"₹{m.get('total_cost_drag',0):>11,.0f}  "
+                  f"{m.get('total_trades', 0):>8}  "
+                  f"{m.get('win_rate_pct', 0):>8.1f}%  "
+                  f"₹{m.get('gross_pnl', 0):>11,.0f}  "
+                  f"₹{m.get('total_cost_drag', 0):>11,.0f}  "
                   f"₹{net:>11,.0f}  "
-                  f"{m.get('max_drawdown_pct',0):>7.1f}%  {icon}")
+                  f"{m.get('max_drawdown_pct', 0):>7.1f}%  {icon}")
             m['confidence_threshold'] = conf
             results.append(m)
         else:
@@ -120,12 +128,12 @@ def print_final_verdict(sweep_results):
     best     = max(sweep_results, key=lambda x: x.get('total_net_pnl', -999999))
 
     if positive:
-        p = positive[0]
+        p       = positive[0]
         monthly = p['total_net_pnl'] / 6
         annual  = p['annual_return_pct']
         print(f"\n  ✅ NET POSITIVE FOUND at confidence ≥ {p['confidence_threshold']}")
         print(f"\n  Key metrics:")
-        print(f"    Trades:       {p['total_trades']} (manageable frequency)")
+        print(f"    Trades:       {p['total_trades']}")
         print(f"    Win Rate:     {p['win_rate_pct']:.1f}%")
         print(f"    Net PnL:      ₹{p['total_net_pnl']:+,.0f} over 6 months")
         print(f"    Monthly avg:  ₹{monthly:+,.0f}")
@@ -142,8 +150,8 @@ def print_final_verdict(sweep_results):
         print(f"  Best result: conf≥{b['confidence_threshold']} | "
               f"Trades:{b['total_trades']} | Net:₹{b['total_net_pnl']:+,.0f}")
         print(f"\n  CONCLUSION: Sep 2025–Feb 2026 was a RANGING market.")
-        print(f"  ORB has a real gross edge (+₹{b['gross_pnl']:,.0f})")
-        print(f"  but transaction costs are too high for this trade frequency.")
+        print(f"  ORB has a real gross edge (+₹{b.get('gross_pnl', 0):,.0f})")
+        print(f"  but transaction costs are too high at this trade frequency.")
         print()
         print(f"  RECOMMENDATION: Start PAPER TRADING NOW with conf≥90")
         print(f"  Reason: Backtest covers a BAD 6-month period for ORB.")

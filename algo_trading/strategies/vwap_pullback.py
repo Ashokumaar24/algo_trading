@@ -1,7 +1,11 @@
 # ============================================================
 #  strategies/vwap_pullback.py
 #  VWAP Pullback Strategy — Core strategy of the AI Hybrid
-#  Trend: 20 EMA + VWAP  |  Entry on pullback + confirmation candle
+#
+#  FIX: `prev_low` falsy check was `if prev_low else close`
+#       which evaluates to `close` when prev_low is 0 or any
+#       small number Python considers falsy.
+#       Changed to explicit `if prev_low is not None else close`.
 # ============================================================
 
 import pandas as pd
@@ -26,7 +30,7 @@ class VWAPPullbackStrategy(BaseStrategy):
     LONG Setup:
     1. Price above VWAP AND VWAP > 20 EMA (uptrend)
     2. 20 EMA sloping upward (EMA[-1] > EMA[-3])
-    3. Previous candle pulled back to VWAP (low ≤ VWAP + tolerance)
+    3. Previous candle pulled back to VWAP (low <= VWAP + tolerance)
     4. Previous candle CLOSED above VWAP (held above)
     5. Current (signal) candle: bullish close above prev high
 
@@ -39,8 +43,8 @@ class VWAPPullbackStrategy(BaseStrategy):
 
     def __init__(self):
         super().__init__("VWAP_PULLBACK")
-        self._pullback_seen: dict   = {}  # {symbol: candle}
-        self._trade_taken: set      = set()
+        self._pullback_seen: dict = {}
+        self._trade_taken: set   = set()
 
     def reset_daily(self):
         self._pullback_seen.clear()
@@ -50,18 +54,7 @@ class VWAPPullbackStrategy(BaseStrategy):
     def check_entry(self, symbol: str, candle: dict,
                     candle_history: pd.DataFrame,
                     prev_candle: Optional[dict] = None) -> Optional[Signal]:
-        """
-        Check for VWAP pullback entry on the current closed candle.
 
-        Args:
-            symbol:         Stock symbol
-            candle:         Current completed 5-min candle
-            candle_history: DataFrame of historical 5-min candles
-            prev_candle:    Previous closed candle (for pullback check)
-
-        Returns:
-            Signal or None
-        """
         if symbol in self._trade_taken:
             return None
 
@@ -109,27 +102,29 @@ class VWAPPullbackStrategy(BaseStrategy):
         # LONG SETUP
         # ================================================================
         trend_up = (
-            close > vwap_curr and                       # price above VWAP
-            vwap_curr > ema20_curr and                  # VWAP above EMA
-            ema20_curr > ema20_prev3                    # EMA sloping up
+            close > vwap_curr and
+            vwap_curr > ema20_curr and
+            ema20_curr > ema20_prev3
         )
 
         pullback_to_vwap_long = (
-            prev_low <= vwap_curr + tol and             # prev candle touched VWAP
-            prev_close > vwap_curr                      # but closed above VWAP
+            prev_low is not None and
+            prev_low <= vwap_curr + tol and
+            prev_close > vwap_curr
         )
 
         confirmation_long = (
-            close > open_ and                           # current is bullish
-            close > prev_high and                       # breaks above prev high
-            low > vwap_curr - tol                       # stays above VWAP
+            close > open_ and
+            prev_high is not None and
+            close > prev_high and
+            low > vwap_curr - tol
         )
 
         if trend_up and pullback_to_vwap_long and confirmation_long:
             sl     = min(prev_low, vwap_curr - tol) - atr_val * 0.1
             risk   = close - sl
-            target = close + 2.0 * risk                 # 1:2 RR
-            t1     = close + 1.0 * risk                 # 1R for breakeven move
+            target = close + 2.0 * risk
+            t1     = close + 1.0 * risk  # noqa: F841 — kept for reference
 
             conf = self._confidence(close, vwap_curr, ema20_curr, ema20_prev3,
                                     atr_val, "LONG")
@@ -158,13 +153,17 @@ class VWAPPullbackStrategy(BaseStrategy):
         )
 
         pullback_to_vwap_short = (
+            prev_high is not None and
             prev_high >= vwap_curr - tol and
             prev_close < vwap_curr
         )
 
         confirmation_short = (
-            close < open_ and                           # current is bearish
-            close < (prev_low if prev_low else close) and
+            close < open_ and
+            # FIX: was `(prev_low if prev_low else close)` — evaluates to close
+            #      when prev_low=0 or any falsy numeric value.
+            #      Changed to explicit None check.
+            close < (prev_low if prev_low is not None else close) and
             high < vwap_curr + tol
         )
 
@@ -172,7 +171,7 @@ class VWAPPullbackStrategy(BaseStrategy):
             sl     = max(prev_high, vwap_curr + tol) + atr_val * 0.1
             risk   = sl - close
             target = close - 2.0 * risk
-            t1     = close - 1.0 * risk
+            t1     = close - 1.0 * risk  # noqa: F841
 
             conf = self._confidence(close, vwap_curr, ema20_curr, ema20_prev3,
                                     atr_val, "SHORT")
@@ -197,24 +196,21 @@ class VWAPPullbackStrategy(BaseStrategy):
                     atr_val, direction) -> float:
         score = 50.0
 
-        # EMA trend strength
-        ema_slope_pct = abs(ema20 - ema20_3ago) / ema20_3ago * 100
+        ema_slope_pct = abs(ema20 - ema20_3ago) / ema20_3ago * 100 if ema20_3ago != 0 else 0
         if ema_slope_pct > 0.05:
             score += 20
         elif ema_slope_pct > 0.02:
             score += 10
 
-        # Distance from VWAP (should be modest — not too extended)
-        dist_pct = abs(close - vwap_val) / vwap_val * 100
+        dist_pct = abs(close - vwap_val) / vwap_val * 100 if vwap_val != 0 else 0
         if 0.1 <= dist_pct <= 0.5:
             score += 20
         elif dist_pct < 0.1:
-            score += 5  # too close to VWAP — chop risk
+            score += 5
         elif dist_pct > 0.8:
-            score -= 10  # too extended
+            score -= 10
 
-        # ATR context
-        atr_pct = atr_val / close * 100
+        atr_pct = atr_val / close * 100 if close != 0 else 0
         if 0.3 <= atr_pct <= 1.0:
             score += 10
 

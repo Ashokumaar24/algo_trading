@@ -1,11 +1,18 @@
 # ============================================================
 #  execution/order_manager.py
 #  Order placement, modification, and monitoring via KiteConnect
+#
+#  FIX: Zerodha disabled Bracket Orders (BO) for equity in 2020.
+#       Replaced with:
+#         - Regular MIS LIMIT order for entry
+#         - SL-M order for stop loss (tracked by order_id)
+#         - LIMIT order for target (tracked by order_id)
+#       SL modifications now cancel + re-place the SL-M order.
 # ============================================================
 
 import time
 from datetime import datetime
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 
 from kiteconnect import KiteConnect
 
@@ -14,42 +21,58 @@ from risk.risk_manager import RiskManager
 from regime.market_regime import MarketRegime
 from utils.logger import get_logger, TradeLogger
 
-logger      = get_logger("order_manager")
-trade_log   = TradeLogger()
+logger    = get_logger("order_manager")
+trade_log = TradeLogger()
+
+
+class ActivePosition:
+    """Tracks all order IDs for a single open position"""
+    def __init__(self, signal: Signal, entry_order_id: str,
+                 sl_order_id: str, target_order_id: str):
+        self.signal           = signal
+        self.entry_order_id   = entry_order_id
+        self.sl_order_id      = sl_order_id
+        self.target_order_id  = target_order_id
+        self.current_sl       = signal.stop_loss
+        self.entry_time       = datetime.now()
 
 
 class OrderManager:
     """
     Handles all order lifecycle operations:
-    - Place bracket orders (BO) via KiteConnect
+    - Place MIS LIMIT entry + SL-M stop + LIMIT target orders
     - Monitor open positions for trailing SL updates
     - Force-close all positions at 3:15 PM
     - Log completed trades for performance analysis
     """
 
     def __init__(self, kite: KiteConnect, risk_manager: RiskManager):
-        self.kite          = kite
-        self.risk_manager  = risk_manager
-        self.active_signals: Dict[str, Signal]  = {}   # order_id → Signal
-        self.active_sl:     Dict[str, float]    = {}   # order_id → current SL
+        self.kite             = kite
+        self.risk_manager     = risk_manager
+        self.positions: Dict[str, ActivePosition] = {}   # entry_order_id → position
 
     # ------------------------------------------------------------------
     # PLACE ORDER
     # ------------------------------------------------------------------
     def place_order(self, signal: Signal, regime: Optional[MarketRegime] = None,
-                     dry_run: bool = False) -> Optional[str]:
+                    dry_run: bool = False) -> Optional[str]:
         """
-        Place a bracket order for the given signal.
+        Place entry + SL + target orders for the given signal.
+
+        FIX: Was using variety='bo' (Bracket Order) which Zerodha disabled.
+             Now uses three separate regular MIS orders:
+               1. LIMIT order  → entry
+               2. SL-M order   → stop loss  (trigger = signal.stop_loss)
+               3. LIMIT order  → target
 
         Args:
             signal:   Validated Signal object with position_size set
             regime:   Current market regime (for size multiplier)
-            dry_run:  If True, log the order but don't actually place it
+            dry_run:  If True, log but don't actually place orders
 
         Returns:
-            order_id string or None on failure
+            entry_order_id string or None on failure
         """
-        # --- Validate ---
         if not signal.is_valid():
             logger.error(f"Invalid signal rejected: {signal}")
             return None
@@ -61,7 +84,6 @@ class OrderManager:
         if not self.risk_manager.passes_confidence_gate(signal):
             return None
 
-        # --- Calculate position size if not already set ---
         if signal.position_size <= 0:
             size_mult = regime.size_multiplier if regime else 1.0
             signal.position_size = self.risk_manager.calculate_position_size(
@@ -72,91 +94,148 @@ class OrderManager:
             logger.error(f"Zero position size for {signal.symbol} — skipping")
             return None
 
-        qty  = signal.position_size
-        side = 'BUY' if signal.direction == Direction.LONG else 'SELL'
-
-        sq_off = abs(signal.target - signal.entry)
-        sl_pts = abs(signal.entry - signal.stop_loss)
+        qty         = signal.position_size
+        tradingsym  = signal.symbol.replace("NSE:", "")
+        side        = 'BUY' if signal.direction == Direction.LONG else 'SELL'
+        sl_side     = 'SELL' if signal.direction == Direction.LONG else 'BUY'
 
         logger.info(
-            f"Placing {'DRY RUN ' if dry_run else ''}Order | "
+            f"Placing {'DRY RUN ' if dry_run else ''}Orders | "
             f"{signal.symbol} {side} {qty} @ {signal.entry:.2f} | "
-            f"SL:{sl_pts:.2f} pts | Target:{sq_off:.2f} pts | "
+            f"SL:{signal.stop_loss:.2f} | Target:{signal.target:.2f} | "
             f"Strategy:{signal.strategy} | Confidence:{signal.confidence:.0f}"
         )
 
+        # ---- DRY RUN ----
         if dry_run:
-            fake_order_id = f"DRY_{signal.symbol}_{int(time.time())}"
-            signal.order_id = fake_order_id
+            fake_id = f"DRY_{tradingsym}_{int(time.time())}"
+            signal.order_id = fake_id
             signal.status   = SignalStatus.ACTIVE
-            self.active_signals[fake_order_id] = signal
-            self.active_sl[fake_order_id]      = signal.stop_loss
+            pos = ActivePosition(signal, fake_id, f"{fake_id}_SL", f"{fake_id}_TGT")
+            self.positions[fake_id] = pos
             self.risk_manager.record_trade_entry()
-            logger.info(f"[DRY RUN] Order simulated: {fake_order_id}")
-            return fake_order_id
+            logger.info(f"[DRY RUN] Orders simulated: entry={fake_id}")
+            return fake_id
 
-        # --- Place real Bracket Order ---
+        # ---- LIVE: Place 3 separate orders ----
+        entry_order_id  = None
+        sl_order_id     = None
+        target_order_id = None
+
         try:
-            order_params = dict(
-                tradingsymbol=signal.symbol.replace("NSE:", ""),
+            # --- 1. Entry order (LIMIT) ---
+            entry_order_id = str(self.kite.place_order(
+                tradingsymbol=tradingsym,
                 exchange="NSE",
                 transaction_type=side,
                 quantity=qty,
                 order_type="LIMIT",
                 price=signal.entry,
-                product="MIS",           # Intraday
-                variety="bo",            # Bracket Order
-                stoploss=round(sl_pts, 2),
-                squareoff=round(sq_off, 2),
-                trailing_stoploss=0,     # We trail manually
-            )
+                product="MIS",
+                variety="regular",
+                tag=f"ENTRY_{signal.strategy[:6]}"
+            ))
+            logger.info(f"Entry order placed: {entry_order_id}")
 
-            order_id = self.kite.place_order(**order_params)
+            # Small delay to avoid rapid-fire order rejection
+            time.sleep(0.3)
 
-            signal.order_id = str(order_id)
-            signal.status   = SignalStatus.ACTIVE
-            self.active_signals[signal.order_id] = signal
-            self.active_sl[signal.order_id]      = signal.stop_loss
+            # --- 2. Stop Loss order (SL-M — Stop Loss Market) ---
+            sl_trigger = signal.stop_loss
+            sl_order_id = str(self.kite.place_order(
+                tradingsymbol=tradingsym,
+                exchange="NSE",
+                transaction_type=sl_side,
+                quantity=qty,
+                order_type="SL-M",
+                trigger_price=round(sl_trigger, 2),
+                product="MIS",
+                variety="regular",
+                tag=f"SL_{signal.strategy[:6]}"
+            ))
+            logger.info(f"SL-M order placed: {sl_order_id} @ trigger {sl_trigger:.2f}")
 
-            self.risk_manager.record_trade_entry()
+            time.sleep(0.3)
 
-            logger.info(f"ORDER PLACED ✓ | ID:{order_id} | {signal}")
-            return signal.order_id
+            # --- 3. Target order (LIMIT) ---
+            target_order_id = str(self.kite.place_order(
+                tradingsymbol=tradingsym,
+                exchange="NSE",
+                transaction_type=sl_side,
+                quantity=qty,
+                order_type="LIMIT",
+                price=signal.target,
+                product="MIS",
+                variety="regular",
+                tag=f"TGT_{signal.strategy[:6]}"
+            ))
+            logger.info(f"Target order placed: {target_order_id} @ {signal.target:.2f}")
 
         except Exception as e:
             logger.error(f"Order placement failed for {signal.symbol}: {e}")
+            # Cancel any partial orders placed before the failure
+            self._cancel_partial_orders(entry_order_id, sl_order_id, target_order_id)
             return None
 
+        signal.order_id = entry_order_id
+        signal.status   = SignalStatus.ACTIVE
+
+        pos = ActivePosition(signal, entry_order_id, sl_order_id, target_order_id)
+        self.positions[entry_order_id] = pos
+        self.risk_manager.record_trade_entry()
+
+        logger.info(
+            f"ORDER SET PLACED ✓ | Entry:{entry_order_id} "
+            f"SL:{sl_order_id} Target:{target_order_id} | {signal}"
+        )
+        return entry_order_id
+
     # ------------------------------------------------------------------
-    # MONITOR POSITIONS (call on every tick or candle close)
+    # CANCEL PARTIAL ORDERS (called on partial placement failure)
+    # ------------------------------------------------------------------
+    def _cancel_partial_orders(self, *order_ids):
+        """Cancel any orders that were placed before a failure"""
+        for oid in order_ids:
+            if oid is None:
+                continue
+            try:
+                self.kite.cancel_order(variety="regular", order_id=oid)
+                logger.info(f"Cancelled partial order: {oid}")
+            except Exception as e:
+                logger.warning(f"Could not cancel order {oid}: {e}")
+
+    # ------------------------------------------------------------------
+    # MONITOR POSITIONS
     # ------------------------------------------------------------------
     def monitor_positions(self, symbol_prices: Dict[str, float]):
         """
         Check all active positions for:
         - Trailing SL updates
-        - Target hit (informational — BO handles this)
+        - SL or Target hit (via order status polling)
         - Time-based exits
-
-        Args:
-            symbol_prices: Dict {symbol: current_price}
         """
-        for order_id, signal in list(self.active_signals.items()):
+        for entry_oid, pos in list(self.positions.items()):
+            signal = pos.signal
             if signal.status != SignalStatus.ACTIVE:
                 continue
 
-            symbol  = signal.symbol
-            price   = symbol_prices.get(symbol)
+            symbol = signal.symbol
+            price  = symbol_prices.get(symbol)
             if price is None:
                 continue
 
-            current_sl = self.active_sl.get(order_id, signal.stop_loss)
+            # Check if SL or target order has been filled
+            self._sync_order_status(entry_oid, pos)
 
-            # Check trailing SL
-            new_sl = self.risk_manager.should_trail_stop(signal, price, current_sl)
+            if signal.status != SignalStatus.ACTIVE:
+                continue
+
+            # Trailing SL
+            new_sl = self.risk_manager.should_trail_stop(signal, price, pos.current_sl)
             if new_sl:
-                self._modify_sl(order_id, signal, new_sl)
+                self._modify_sl(entry_oid, pos, new_sl)
 
-            # Time-based exit check
+            # Time-based exit
             is_loss = (
                 (signal.direction == Direction.LONG  and price < signal.entry) or
                 (signal.direction == Direction.SHORT and price > signal.entry)
@@ -165,57 +244,137 @@ class OrderManager:
                 has_open_position=True, is_loss=is_loss
             )
             if time_action in ('FORCE_CLOSE', 'CLOSE_LOSERS'):
-                logger.info(f"Time-based exit triggered [{time_action}] for {symbol}")
-                self.close_position(order_id, price, reason=time_action)
+                logger.info(f"Time-based exit [{time_action}] for {symbol}")
+                self.close_position(entry_oid, price, reason=time_action)
 
     # ------------------------------------------------------------------
-    # MODIFY SL
+    # SYNC ORDER STATUS (check if SL or target filled externally)
     # ------------------------------------------------------------------
-    def _modify_sl(self, order_id: str, signal: Signal, new_sl: float):
-        """Modify bracket order SL via KiteConnect"""
+    def _sync_order_status(self, entry_oid: str, pos: ActivePosition):
+        """Poll order status to detect if SL or target was hit by exchange"""
         try:
-            sl_points = abs(signal.entry - new_sl)
-            self.kite.modify_order(
-                variety="bo",
-                order_id=order_id,
-                stoploss=round(sl_points, 2)
-            )
-            self.active_sl[order_id] = new_sl
-            logger.info(
-                f"SL Modified | {signal.symbol} | New SL: {new_sl:.2f}"
-            )
+            orders = self.kite.orders()
+            orders_by_id = {str(o['order_id']): o for o in orders}
+
+            sl_order  = orders_by_id.get(pos.sl_order_id)
+            tgt_order = orders_by_id.get(pos.target_order_id)
+
+            if sl_order and sl_order['status'] == 'COMPLETE':
+                exit_price = sl_order.get('average_price', pos.current_sl)
+                self._record_closed_position(
+                    entry_oid, pos, exit_price, 'SL_HIT'
+                )
+
+            elif tgt_order and tgt_order['status'] == 'COMPLETE':
+                exit_price = tgt_order.get('average_price', pos.signal.target)
+                self._record_closed_position(
+                    entry_oid, pos, exit_price, 'TARGET_HIT'
+                )
+
         except Exception as e:
-            logger.error(f"SL modification failed for {order_id}: {e}")
+            logger.debug(f"Order status sync error for {entry_oid}: {e}")
 
     # ------------------------------------------------------------------
-    # CLOSE POSITION
+    # MODIFY SL (cancel + re-place SL-M order with new trigger)
     # ------------------------------------------------------------------
-    def close_position(self, order_id: str, exit_price: float,
-                        reason: str = "manual"):
-        """Close an open bracket order position"""
-        signal = self.active_signals.get(order_id)
-        if not signal:
+    def _modify_sl(self, entry_oid: str, pos: ActivePosition, new_sl: float):
+        """
+        FIX: BO had a simple modify endpoint.
+             With regular orders we must cancel the old SL-M and place a new one.
+        """
+        signal    = pos.signal
+        tradingsym = signal.symbol.replace("NSE:", "")
+        sl_side   = 'SELL' if signal.direction == Direction.LONG else 'BUY'
+        qty       = signal.position_size
+
+        try:
+            # Cancel old SL order
+            self.kite.cancel_order(variety="regular", order_id=pos.sl_order_id)
+            time.sleep(0.2)
+
+            # Place new SL-M order
+            new_sl_order_id = str(self.kite.place_order(
+                tradingsymbol=tradingsym,
+                exchange="NSE",
+                transaction_type=sl_side,
+                quantity=qty,
+                order_type="SL-M",
+                trigger_price=round(new_sl, 2),
+                product="MIS",
+                variety="regular",
+                tag="TRAIL_SL"
+            ))
+
+            old_sl            = pos.current_sl
+            pos.sl_order_id   = new_sl_order_id
+            pos.current_sl    = new_sl
+
+            logger.info(
+                f"SL Trailed | {signal.symbol} | "
+                f"{old_sl:.2f} → {new_sl:.2f} | New SL order: {new_sl_order_id}"
+            )
+
+        except Exception as e:
+            logger.error(f"SL modification failed for {entry_oid}: {e}")
+
+    # ------------------------------------------------------------------
+    # CLOSE POSITION (manual / time-based exit)
+    # ------------------------------------------------------------------
+    def close_position(self, entry_oid: str, exit_price: float,
+                       reason: str = "manual"):
+        """Close a position by cancelling pending SL/target and placing market exit"""
+        pos = self.positions.get(entry_oid)
+        if not pos:
             return
 
-        try:
-            self.kite.exit_order(variety="bo", order_id=order_id)
-        except Exception as e:
-            logger.error(f"Exit order failed for {order_id}: {e}")
+        signal    = pos.signal
+        tradingsym = signal.symbol.replace("NSE:", "")
+        exit_side = 'SELL' if signal.direction == Direction.LONG else 'BUY'
+        qty       = signal.position_size
 
-        # Calculate PnL
+        # Cancel open SL and target orders first
+        for oid in [pos.sl_order_id, pos.target_order_id]:
+            if oid:
+                try:
+                    self.kite.cancel_order(variety="regular", order_id=oid)
+                except Exception:
+                    pass
+
+        # Place market exit
+        try:
+            self.kite.place_order(
+                tradingsymbol=tradingsym,
+                exchange="NSE",
+                transaction_type=exit_side,
+                quantity=qty,
+                order_type="MARKET",
+                product="MIS",
+                variety="regular",
+                tag="MANUAL_EXIT"
+            )
+        except Exception as e:
+            logger.error(f"Market exit failed for {signal.symbol}: {e}")
+
+        self._record_closed_position(entry_oid, pos, exit_price, reason)
+
+    # ------------------------------------------------------------------
+    # RECORD CLOSED POSITION
+    # ------------------------------------------------------------------
+    def _record_closed_position(self, entry_oid: str, pos: ActivePosition,
+                                 exit_price: float, reason: str):
+        """Log P&L and clean up position tracking"""
+        signal = pos.signal
         if signal.direction == Direction.LONG:
             pnl = (exit_price - signal.entry) * signal.position_size
         else:
             pnl = (signal.entry - exit_price) * signal.position_size
 
         outcome = "WIN" if pnl > 0 else "LOSS"
-        signal.status = SignalStatus.HIT_TARGET if pnl > 0 else SignalStatus.HIT_SL
+        signal.status = SignalStatus.HIT_TARGET if reason == 'TARGET_HIT' else SignalStatus.HIT_SL
 
         self.risk_manager.record_trade_exit(pnl)
 
-        # Log trade
-        entry_time = signal.timestamp
-        hold_mins  = int((datetime.now() - entry_time).total_seconds() / 60)
+        hold_mins = int((datetime.now() - pos.entry_time).total_seconds() / 60)
 
         trade_log.log_trade(
             symbol=signal.symbol,
@@ -235,8 +394,7 @@ class OrderManager:
             notes=f"{reason} | {signal.notes}"
         )
 
-        del self.active_signals[order_id]
-        self.active_sl.pop(order_id, None)
+        self.positions.pop(entry_oid, None)
 
         logger.info(
             f"Position Closed | {signal.symbol} | PnL: ₹{pnl:+,.0f} | "
@@ -244,44 +402,53 @@ class OrderManager:
         )
 
     # ------------------------------------------------------------------
-    # FORCE CLOSE ALL
+    # FORCE CLOSE ALL (3:15 PM)
     # ------------------------------------------------------------------
     def force_close_all(self):
-        """Emergency / EOD close of ALL positions. Call at 3:15 PM."""
+        """Emergency / EOD close of ALL positions."""
         logger.warning("FORCE CLOSING ALL POSITIONS (3:15 PM)")
 
+        # First cancel all pending SL and target orders
+        for pos in list(self.positions.values()):
+            for oid in [pos.sl_order_id, pos.target_order_id]:
+                if oid:
+                    try:
+                        self.kite.cancel_order(variety="regular", order_id=oid)
+                    except Exception:
+                        pass
+
+        # Then close net positions via market orders
         try:
             positions = self.kite.positions().get('day', [])
-            for pos in positions:
-                qty = pos.get('quantity', 0)
+            for p in positions:
+                qty = p.get('quantity', 0)
                 if qty == 0:
                     continue
-
                 side = 'SELL' if qty > 0 else 'BUY'
                 try:
                     self.kite.place_order(
-                        tradingsymbol=pos['tradingsymbol'],
-                        exchange=pos['exchange'],
+                        tradingsymbol=p['tradingsymbol'],
+                        exchange=p['exchange'],
                         transaction_type=side,
                         quantity=abs(qty),
                         order_type='MARKET',
                         product='MIS',
-                        variety='regular'
+                        variety='regular',
+                        tag='EOD_CLOSE'
                     )
-                    logger.info(
-                        f"Force closed: {pos['tradingsymbol']} {abs(qty)} shares"
-                    )
+                    logger.info(f"Force closed: {p['tradingsymbol']} qty={abs(qty)}")
                 except Exception as e:
-                    logger.error(
-                        f"Force close failed for {pos['tradingsymbol']}: {e}"
-                    )
-
+                    logger.error(f"Force close failed for {p['tradingsymbol']}: {e}")
         except Exception as e:
             logger.error(f"force_close_all failed: {e}")
+
+        self.positions.clear()
 
     # ------------------------------------------------------------------
     # STATUS
     # ------------------------------------------------------------------
     def get_active_count(self) -> int:
-        return len([s for s in self.active_signals.values()
-                    if s.status == SignalStatus.ACTIVE])
+        return sum(
+            1 for pos in self.positions.values()
+            if pos.signal.status == SignalStatus.ACTIVE
+        )
