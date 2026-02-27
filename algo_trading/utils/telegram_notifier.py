@@ -2,29 +2,29 @@
 #  utils/telegram_notifier.py
 #  Telegram Bot — Trading system notifications
 #
+#  BUG 6 FIX: notify_eod_summary() now reads wins/losses from
+#    status dict (populated by main.py _end_of_day). Previously
+#    used status.get('wins') which never existed in risk_manager
+#    snapshot → always showed "Win Rate: N/A".
+#
+#  BUG 7 FIX: notify_eod_summary() now accepts and uses
+#    journal_path parameter to attach markdown journal file.
+#    Previously journal_path was never passed from main.py.
+#
 #  Sends you:
 #    ✅ Daily startup confirmation
 #    📊 Pre-market scanner results
 #    🌍 Market regime classification
 #    🚨 Every signal that fires (entry/SL/target)
-#    🚫 Why trades were blocked (regime, cap, etc.)
-#    📓 End-of-day journal summary
+#    📓 End-of-day journal summary + attached markdown
 #    ❌ Any system errors
 #
-#  You can send commands back:
+#  Commands you can send back:
 #    /status  → current positions + P&L
 #    /stop    → emergency halt (no new trades)
 #    /resume  → re-enable trading after /stop
 #    /journal → get today's journal early
-#
-#  Setup (one time, 5 minutes, FREE):
-#    1. Open Telegram → search @BotFather
-#    2. Send /newbot → follow prompts → get BOT_TOKEN
-#    3. Search your new bot → click Start
-#    4. Visit: https://api.telegram.org/bot{BOT_TOKEN}/getUpdates
-#    5. Send any message to your bot, refresh the URL
-#    6. Copy the "id" from "chat" section → that's your CHAT_ID
-#    7. Add both to api_key.txt (lines 6 and 7)
+#    /help    → show all commands
 # ============================================================
 
 import requests
@@ -181,9 +181,12 @@ class TelegramNotifier:
 
         if text == "/stop":
             self._stop_requested = True
-            self.send("🛑 <b>EMERGENCY STOP activated.</b>\nNo new trades will be placed.\n"
-                      "Existing positions will still be monitored and closed at 3:15 PM.\n"
-                      "Send /resume to re-enable.")
+            self.send(
+                "🛑 <b>EMERGENCY STOP activated.</b>\n"
+                "No new trades will be placed.\n"
+                "Existing positions will still be monitored and closed at 3:15 PM.\n"
+                "Send /resume to re-enable."
+            )
 
         elif text == "/resume":
             self._stop_requested = False
@@ -208,8 +211,14 @@ class TelegramNotifier:
     def _send_status(self):
         try:
             if self._trading_system:
-                status = self._trading_system.risk_manager.get_status()
+                status      = self._trading_system.risk_manager.get_status()
                 stop_status = "🛑 STOPPED (use /resume)" if self._stop_requested else "✅ ACTIVE"
+                regime_str  = ""
+                if hasattr(self._trading_system, '_current_regime') and \
+                   self._trading_system._current_regime:
+                    r = self._trading_system._current_regime
+                    regime_str = f"\nRegime:  {r.trend} + {r.volatility} (VIX {r.india_vix:.1f})"
+
                 self.send(
                     f"📊 <b>System Status</b>\n\n"
                     f"Mode: {stop_status}\n"
@@ -218,6 +227,7 @@ class TelegramNotifier:
                     f"Daily P&amp;L: ₹{status['daily_pnl']:+,.0f}\n"
                     f"Consecutive losses: {status['consecutive_losses']}\n"
                     f"Can trade: {'Yes ✅' if status['can_trade'] and not self._stop_requested else 'No 🚫'}"
+                    f"{regime_str}"
                 )
             else:
                 self.send("⚠️ Trading system not yet initialised.")
@@ -229,10 +239,12 @@ class TelegramNotifier:
             from utils.daily_journal import get_journal
             journal = get_journal()
             if os.path.exists(journal.report_path):
-                self.send_document(journal.report_path, caption="📓 Today's trading journal")
+                self.send_document(journal.report_path,
+                                   caption="📓 Today's trading journal")
             else:
                 path = journal.generate_report()
-                self.send_document(path, caption="📓 Journal generated on demand")
+                self.send_document(path,
+                                   caption="📓 Journal generated on demand")
         except Exception as e:
             self.send(f"⚠️ Journal error: {e}")
 
@@ -266,14 +278,17 @@ class TelegramNotifier:
             self.send("📊 Scanner complete — no candidates found today.")
             return
 
-        regime_str = f"{regime.trend} + {regime.volatility}" if regime else "Unknown"
-        tradeable  = "✅ Tradeable" if (regime and regime.is_tradeable) else "🚫 NOT Tradeable"
+        regime_str = (f"{regime.trend} + {regime.volatility}"
+                      if regime else "Unknown")
+        tradeable  = ("✅ Tradeable"
+                      if (regime and regime.is_tradeable) else "🚫 NOT Tradeable")
 
         lines = [f"🔍 <b>Pre-Market Scanner Results</b>"]
         lines.append(f"Regime: {regime_str} {tradeable}\n")
 
         for i, c in enumerate(candidates[:5], 1):
-            bias_icon = "🟢" if getattr(c, 'bias', '') == 'BULLISH' else "🔴" if getattr(c, 'bias', '') == 'BEARISH' else "⚪"
+            bias = getattr(c, 'bias', '')
+            bias_icon = "🟢" if bias == 'BULLISH' else "🔴" if bias == 'BEARISH' else "⚪"
             lines.append(
                 f"{i}. {bias_icon} <b>{c.symbol.replace('NSE:','')}</b> "
                 f"| Score: {c.score:.0f} "
@@ -287,14 +302,15 @@ class TelegramNotifier:
         self.send("\n".join(lines))
 
     def notify_signal(self, signal, dry_run: bool = True):
-        mode = "📄 DRY RUN" if dry_run else "💰 LIVE ORDER"
+        mode           = "📄 DRY RUN" if dry_run else "💰 LIVE ORDER"
         direction_icon = "📈" if "LONG" in str(signal.direction) else "📉"
-        risk = abs(signal.entry - signal.stop_loss)
-        reward = abs(signal.target - signal.entry)
+        risk           = abs(signal.entry - signal.stop_loss)
+        reward         = abs(signal.target - signal.entry)
 
         self.send(
             f"🚨 <b>SIGNAL FIRED — {mode}</b>\n\n"
-            f"{direction_icon} <b>{signal.symbol.replace('NSE:','')} {signal.direction.value}</b>\n\n"
+            f"{direction_icon} <b>{signal.symbol.replace('NSE:','')} "
+            f"{signal.direction.value}</b>\n\n"
             f"Strategy:   {signal.strategy}\n"
             f"Entry:      ₹{signal.entry:.2f}\n"
             f"Stop Loss:  ₹{signal.stop_loss:.2f} (risk: ₹{risk:.2f}/share)\n"
@@ -314,6 +330,7 @@ class TelegramNotifier:
             'TIME_EXIT_1230': "⏰ Time Exit (12:30 PM)",
             'EOD_CLOSE':      "🔔 End of Day Close",
             'FORCE_CLOSE':    "⚡ Force Closed",
+            'SHUTDOWN':       "⚡ System Shutdown",
         }
         exit_label = exit_labels.get(exit_reason, exit_reason)
 
@@ -346,11 +363,24 @@ class TelegramNotifier:
 
     def notify_eod_summary(self, status: dict, journal_path: str = None,
                             dry_run: bool = True):
-        mode  = "Paper Trade" if dry_run else "Live Trade"
-        wins  = status.get('wins', 0)
-        losses = status.get('losses', 0)
-        total  = wins + losses
-        wr     = f"{wins/total*100:.0f}%" if total > 0 else "N/A"
+        """
+        BUG 6 FIX: wins and losses are now passed in via status dict by main.py
+          _end_of_day(). Previously used status.get('wins') which didn't exist
+          in risk_manager.get_state_snapshot() → always showed "Win Rate: N/A".
+
+        BUG 7 FIX: journal_path is now passed so the markdown journal file is
+          attached to the Telegram EOD message as a document.
+        """
+        mode    = "Paper Trade" if dry_run else "Live Trade"
+        wins    = status.get('wins', 0)
+        losses  = status.get('losses', 0)
+        total   = wins + losses
+        wr      = f"{wins/total*100:.0f}%" if total > 0 else "N/A"
+
+        # Include regime in summary if available
+        regime_line = ""
+        if status.get('regime'):
+            regime_line = f"\nRegime:         {status.get('regime')}"
 
         self.send(
             f"📓 <b>End of Day Summary — {mode}</b>\n"
@@ -360,13 +390,18 @@ class TelegramNotifier:
             f"Losses:         {losses}\n"
             f"Win Rate:       {wr}\n"
             f"Daily P&amp;L:     ₹{status.get('daily_pnl', 0):+,.0f}\n"
-            f"Weekly P&amp;L:    ₹{status.get('weekly_pnl', 0):+,.0f}\n\n"
-            f"Journal saved to logs/ ✅"
+            f"Weekly P&amp;L:    ₹{status.get('weekly_pnl', 0):+,.0f}"
+            f"{regime_line}\n\n"
+            f"Journal: {'📎 Attached below ↓' if journal_path else 'Saved to logs/'}"
         )
 
+        # BUG 7 FIX: attach the journal file
         if journal_path and os.path.exists(journal_path):
             time.sleep(1)
-            self.send_document(journal_path, caption=f"📓 Full journal — {datetime.now().strftime('%d %b %Y')}")
+            self.send_document(
+                journal_path,
+                caption=f"📓 Full trading journal — {datetime.now().strftime('%d %b %Y')}"
+            )
 
     def notify_error(self, context: str, error: str):
         self.send(

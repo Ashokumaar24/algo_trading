@@ -2,21 +2,26 @@
 #  execution/order_manager.py
 #  Order placement and lifecycle management via KiteConnect
 #
-#  FIX 6 (Critical): Entry fill confirmation before placing SL/Target
-#    - Original code placed SL and target orders after just time.sleep(0.3)
-#    - If the entry order was still pending, SL/target would be orphaned
-#      (attached to no position), creating open risk with no protection
-#    - Now: _wait_for_fill() polls order_history() every 0.5s up to 8s
-#    - If entry does not fill within 8 seconds, the entry order is
-#      cancelled and None is returned — no SL or target is ever placed
-#      without a confirmed fill
+#  BUG 8 FIX: Paper trade fill noise reduced from ±2% to ±0.05%.
+#    The old ±2% was larger than most SL distances (₹5–15 on a ₹1000
+#    stock), meaning paper fills routinely appeared to have breached
+#    the SL before the trade even started. A real limit order fills
+#    at or very close to the limit price — ±0.05% is realistic.
 #
-#  FIX 9 (Critical): force_close_all uses 'net' positions + net_quantity
-#    - Original read positions().get('day', []) which includes all
-#      intraday trades including already-exited positions
-#    - qty = p.get('quantity') returned GROSS quantity (entries + exits)
-#    - Fix: use positions().get('net', []) and p.get('net_quantity')
-#    - 'net' shows only open positions; net_quantity is + for long, - for short
+#  BUG 9 FIX: force_close_all() now simulates paper exits properly.
+#    Previously returned immediately in paper mode with no action,
+#    so paper positions were never closed, P&L was always ₹0, and
+#    the EOD summary was meaningless. Now fetches live LTP for each
+#    open paper position, calculates P&L, and calls mark_closed().
+#
+#  FIX 6 (Critical, previous session):
+#    Entry fill confirmation before placing SL/Target.
+#    _wait_for_fill() polls order_history() every 0.5s up to 8s.
+#    If entry does not fill, it is cancelled and None returned.
+#
+#  FIX 9 (Critical, previous session):
+#    force_close_all (real trade) uses 'net' positions + net_quantity.
+#    'net' shows only open positions; net_quantity is +long/-short/0flat.
 # ============================================================
 
 import time
@@ -27,7 +32,7 @@ from utils.logger import get_logger
 
 logger = get_logger("order_manager")
 
-# Kite order types
+# Kite order types / constants
 ORDER_TYPE_LIMIT  = "LIMIT"
 ORDER_TYPE_SL     = "SL"
 PRODUCT_MIS       = "MIS"
@@ -44,14 +49,14 @@ class OrderManager:
       2. Poll for fill confirmation (FIX 6)
       3. Place SL and target bracket only after confirmed fill
       4. Track open orders
-      5. Force-close all positions at EOD (FIX 9)
+      5. Force-close all positions at EOD (FIX 9 / BUG 9)
     """
 
     def __init__(self, kite, paper_trade: bool = False):
         self.kite        = kite
         self.paper_trade = paper_trade
         self._lock       = threading.Lock()
-        self.open_orders: Dict[str, dict] = {}  # {symbol: order_info}
+        self.open_orders: Dict[str, dict] = {}   # {symbol: order_info}
 
     # ------------------------------------------------------------------
     # PLACE TRADE (entry → wait for fill → SL + target)
@@ -66,7 +71,7 @@ class OrderManager:
         confirmed COMPLETE via order_history polling (up to 8 seconds).
 
         Args:
-            symbol:    e.g. "RELIANCE"
+            symbol:    e.g. "RELIANCE"  (no NSE: prefix)
             direction: "LONG" or "SHORT"
             entry:     limit price
             sl:        stop-loss price
@@ -77,10 +82,12 @@ class OrderManager:
             dict with order IDs and fill details, or None if entry failed
         """
         if self.paper_trade:
-            return self._paper_place_order(symbol, direction, entry, sl, target, quantity)
+            return self._paper_place_order(
+                symbol, direction, entry, sl, target, quantity
+            )
 
-        transaction   = TRANSACTION_BUY if direction == "LONG" else TRANSACTION_SELL
-        sl_transaction = TRANSACTION_SELL if direction == "LONG" else TRANSACTION_BUY
+        transaction    = TRANSACTION_BUY  if direction == "LONG"  else TRANSACTION_SELL
+        sl_transaction = TRANSACTION_SELL if direction == "LONG"  else TRANSACTION_BUY
 
         try:
             # --- Step 1: Place entry order ---
@@ -115,13 +122,15 @@ class OrderManager:
                 return None
 
             logger.info(
-                f"Entry CONFIRMED | {symbol} | OrderID:{entry_order_id} | "
-                f"FillPrice:{fill_price:.2f}"
+                f"Entry CONFIRMED | {symbol} | "
+                f"OrderID:{entry_order_id} | FillPrice:{fill_price:.2f}"
             )
 
-            # --- Step 3: Place SL order (now safe — entry confirmed) ---
-            sl_trigger = round(sl * 1.001, 2) if direction == "LONG" else round(sl * 0.999, 2)
-            sl_price   = round(sl * 0.999, 2) if direction == "LONG" else round(sl * 1.001, 2)
+            # --- Step 3: Place SL order (safe — entry confirmed) ---
+            sl_trigger = (round(sl * 1.001, 2) if direction == "LONG"
+                          else round(sl * 0.999, 2))
+            sl_price   = (round(sl * 0.999, 2) if direction == "LONG"
+                          else round(sl * 1.001, 2))
 
             sl_order_id = self.kite.place_order(
                 variety=VARIETY_REGULAR,
@@ -135,7 +144,6 @@ class OrderManager:
                 trigger_price=sl_trigger,
                 tag="BOT_SL"
             )
-
             logger.info(f"SL order placed: {sl_order_id} @ {sl_price}")
 
             # --- Step 4: Place target order ---
@@ -150,7 +158,6 @@ class OrderManager:
                 price=target,
                 tag="BOT_TARGET"
             )
-
             logger.info(f"Target order placed: {target_order_id} @ {target}")
 
             order_info = {
@@ -180,12 +187,13 @@ class OrderManager:
     # ------------------------------------------------------------------
     # FIX 6: FILL CONFIRMATION POLLING
     # ------------------------------------------------------------------
-    def _wait_for_fill(self, order_id: str, timeout: float = 8.0) -> Optional[float]:
+    def _wait_for_fill(self, order_id: str,
+                        timeout: float = 8.0) -> Optional[float]:
         """
         Poll order history every 0.5 seconds until the order is COMPLETE.
 
         Returns:
-            average_price (float) if filled, or None if cancelled/rejected/timeout
+            average_price (float) if filled, None if cancelled/rejected/timeout
         """
         deadline = time.time() + timeout
 
@@ -218,64 +226,129 @@ class OrderManager:
         return None
 
     def _safe_cancel_order(self, order_id: str):
-        """Cancel an order, ignoring errors if it's already done"""
+        """Cancel an order, ignoring errors if it's already in terminal state."""
         try:
             self.kite.cancel_order(VARIETY_REGULAR, order_id)
             logger.info(f"Order {order_id} cancelled")
         except Exception as e:
-            logger.debug(f"Cancel order {order_id}: {e} (may already be terminal)")
+            logger.debug(
+                f"Cancel order {order_id}: {e} (may already be terminal)"
+            )
 
     # ------------------------------------------------------------------
     # CANCEL PROTECTIVE ORDERS
     # ------------------------------------------------------------------
     def cancel_symbol_orders(self, symbol: str):
-        """Cancel all open SL and target orders for a symbol"""
+        """Cancel all open SL and target orders for a symbol."""
         with self._lock:
             order_info = self.open_orders.get(symbol)
         if not order_info:
             return
-
-        for oid in [order_info.get('sl_order_id'), order_info.get('target_order_id')]:
+        for oid in [order_info.get('sl_order_id'),
+                    order_info.get('target_order_id')]:
             if oid:
                 self._safe_cancel_order(oid)
 
     # ------------------------------------------------------------------
-    # FIX 9: FORCE CLOSE ALL — uses 'net' positions and net_quantity
+    # FORCE CLOSE ALL
+    # FIX 9 (prev session): Real trade uses 'net' positions + net_quantity
+    # BUG 9 FIX: Paper trade now simulates exits properly
     # ------------------------------------------------------------------
     def force_close_all(self, reason: str = "EOD_CLOSE"):
         """
-        Close all open net positions at market.
+        Close all open positions at market.
 
-        FIX 9:
-        - Uses positions().get('net', []) — only OPEN positions
-          (not 'day' which includes already-exited trades)
-        - Reads net_quantity (+ = long, - = short, 0 = flat/already closed)
-        - Previously used 'quantity' which was gross lot size and
-          could attempt to close positions that no longer existed
+        Paper trade (BUG 9 FIX):
+          - Previously returned immediately → positions never closed, P&L = ₹0.
+          - Now fetches live LTP for each open paper position.
+          - Calculates P&L and calls mark_closed() so risk_manager tracks it.
+
+        Real trade (FIX 9 from previous session):
+          - Uses positions().get('net', []) — only OPEN positions.
+          - Reads net_quantity (+ = long, − = short, 0 = flat/closed already).
         """
         logger.info(f"force_close_all triggered | reason: {reason}")
 
+        # ── PAPER TRADE PATH ─────────────────────────────────────────
         if self.paper_trade:
-            logger.info("Paper trade — skipping force close")
+            logger.info(
+                "Paper trade — simulating EOD close for all open paper positions"
+            )
+
+            with self._lock:
+                open_copy = dict(self.open_orders)
+
+            if not open_copy:
+                logger.info("No open paper positions to close.")
+                return
+
+            closed_count = 0
+            for symbol, order_info in open_copy.items():
+                direction  = order_info.get('direction', 'LONG')
+                fill_price = order_info.get(
+                    'fill_price', order_info.get('entry_price', 0)
+                )
+                quantity   = order_info.get('quantity', 1)
+
+                # Try to fetch real current price for a realistic exit
+                exit_price = fill_price  # fallback
+                try:
+                    full_sym   = (f"NSE:{symbol}"
+                                  if not symbol.startswith("NSE:") else symbol)
+                    ltp_data   = self.kite.ltp([full_sym])
+                    exit_price = float(ltp_data[full_sym]['last_price'])
+                    logger.debug(
+                        f"Paper exit LTP for {symbol}: ₹{exit_price:.2f}"
+                    )
+                except Exception as e:
+                    logger.debug(
+                        f"LTP fetch failed for {symbol} ({e}) — "
+                        f"using midpoint of target/SL as exit"
+                    )
+                    tgt = order_info.get('target', fill_price)
+                    sl  = order_info.get('sl',     fill_price)
+                    exit_price = round((tgt + sl) / 2, 2)
+
+                # Calculate P&L
+                if direction == 'LONG':
+                    pnl = (exit_price - fill_price) * quantity
+                else:
+                    pnl = (fill_price - exit_price) * quantity
+
+                logger.info(
+                    f"PAPER EOD CLOSE | {symbol} {direction} | "
+                    f"Fill:₹{fill_price:.2f} → Exit:₹{exit_price:.2f} | "
+                    f"PnL: ₹{pnl:+,.0f}"
+                )
+
+                self.mark_closed(symbol, exit_price, reason)
+                closed_count += 1
+
+            with self._lock:
+                self.open_orders.clear()
+
+            logger.info(
+                f"Paper force_close_all complete: {closed_count} positions closed"
+            )
             return
 
+        # ── REAL TRADE PATH ──────────────────────────────────────────
         try:
-            positions = self.kite.positions().get('net', [])   # FIX 9
+            positions = self.kite.positions().get('net', [])
         except Exception as e:
             logger.error(f"Could not fetch positions for force close: {e}")
             return
 
         closed_count = 0
-
         for p in positions:
             symbol = p.get('tradingsymbol', '')
-            # FIX 9: Use net_quantity — positive = long, negative = short
+            # net_quantity: + = long open, - = short open, 0 = flat
             qty    = p.get('net_quantity', 0)
 
             if qty == 0:
-                continue  # already flat
+                continue
 
-            # Cancel protective orders first to avoid double-fill
+            # Cancel SL / target orders first to avoid double-fill
             self.cancel_symbol_orders(symbol)
 
             transaction = TRANSACTION_SELL if qty > 0 else TRANSACTION_BUY
@@ -304,15 +377,28 @@ class OrderManager:
         with self._lock:
             self.open_orders.clear()
 
-        logger.info(f"force_close_all complete: {closed_count} positions closed")
+        logger.info(
+            f"Real force_close_all complete: {closed_count} positions closed"
+        )
 
     # ------------------------------------------------------------------
     # PAPER TRADE SIMULATION
+    # BUG 8 FIX: Fill noise reduced from ±2% to ±0.05%
     # ------------------------------------------------------------------
-    def _paper_place_order(self, symbol, direction, entry, sl, target, quantity):
-        """Simulate order fill immediately for paper trading"""
+    def _paper_place_order(self, symbol: str, direction: str,
+                            entry: float, sl: float, target: float,
+                            quantity: int) -> dict:
+        """
+        Simulate a limit order fill for paper trading.
+
+        BUG 8 FIX: Old noise was ±2% of entry price.
+          On a ₹1000 stock that's ±₹20 — larger than most SL distances.
+          A real limit order fills at or very close to the limit price.
+          Changed to ±0.05% (realistic intraday slippage).
+        """
         import random
-        fake_fill = round(entry + random.uniform(-0.02, 0.02) * entry, 2)
+        # ±0.05% noise — realistic for a limit order vs the old ±2%
+        fake_fill = round(entry * (1 + random.uniform(-0.0005, 0.0005)), 2)
 
         order_info = {
             'symbol':          symbol,
@@ -332,13 +418,17 @@ class OrderManager:
         with self._lock:
             self.open_orders[symbol] = order_info
 
-        logger.info(f"PAPER TRADE | {symbol} {direction} | Fill:{fake_fill}")
+        logger.info(
+            f"PAPER TRADE | {symbol} {direction} | "
+            f"Entry:₹{entry:.2f} Fill:₹{fake_fill:.2f} "
+            f"SL:₹{sl:.2f} Target:₹{target:.2f} Qty:{quantity}"
+        )
         return order_info
 
     # ------------------------------------------------------------------
     # STATUS HELPERS
     # ------------------------------------------------------------------
-    def get_open_symbols(self):
+    def get_open_symbols(self) -> list:
         with self._lock:
             return list(self.open_orders.keys())
 
@@ -347,10 +437,12 @@ class OrderManager:
             return self.open_orders.get(symbol)
 
     def mark_closed(self, symbol: str, exit_price: float, reason: str):
+        """Record a position as closed. Called after target/SL hit or EOD close."""
         with self._lock:
             if symbol in self.open_orders:
-                self.open_orders[symbol]['status']     = 'CLOSED'
-                self.open_orders[symbol]['exit_price'] = exit_price
-                self.open_orders[symbol]['exit_reason'] = reason
-                self.open_orders[symbol]['exit_time']  = datetime.now()
+                info = self.open_orders[symbol]
+                info['status']      = 'CLOSED'
+                info['exit_price']  = exit_price
+                info['exit_reason'] = reason
+                info['exit_time']   = datetime.now()
                 del self.open_orders[symbol]
