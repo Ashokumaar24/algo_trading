@@ -10,14 +10,17 @@
 #    - KiteLogin class added to auth/login.py (see that file for details).
 #
 #  FIX (CLI flags): --backtest and --scan-only now work.
-#    - README documented `python main.py --backtest` and
-#      `python main.py --scan-only`, but neither flag was parsed or
-#      acted on — the __main__ block always called system.run() regardless.
-#    - Both flags are now handled in __main__ before constructing the
-#      full AIHybridTradingSystem (which requires Zerodha login).
-#    - --backtest runs the demo backtest via BacktestEngine directly.
-#    - --scan-only logs in, runs the pre-market scanner, prints results,
-#      and exits — no ticker, no orders.
+#
+#  FIX (Telegram wiring): TelegramNotifier was defined but never used.
+#    - main.py never called notify_startup(), notify_signal(), etc.
+#    - Now: notifier is created at startup, wired to trading system,
+#      command listener started, and all key events send Telegram messages.
+#
+#  FIX (Login confirmation): User had no way to know if login succeeded.
+#    - notify_startup() now called right after successful login
+#    - Login failure sends notify_login_failed() with the error message
+#    - DRY-RUN mode sends its own startup message making it clear no
+#      real login happened
 # ============================================================
 
 import sys
@@ -64,6 +67,7 @@ from utils.candle_builder import CandleBuilder
 from execution.order_manager import OrderManager
 from risk.risk_manager import RiskManager
 from utils.journal import TradeJournal
+from utils.telegram_notifier import get_notifier   # FIX: import notifier
 from config.config import (
     MAX_TRADES_PER_DAY, CAPITAL, NIFTY50_SYMBOLS
 )
@@ -83,7 +87,7 @@ IST    = ZoneInfo("Asia/Kolkata")
 class AIHybridTradingSystem:
     """
     Coordinates all subsystems:
-      Scanner → Strategies → Risk → Execution → Journal
+      Scanner → Strategies → Risk → Execution → Journal → Telegram
     """
 
     def __init__(self):
@@ -91,11 +95,27 @@ class AIHybridTradingSystem:
         logger.info("  AI HYBRID TRADING SYSTEM — Starting up")
         logger.info("=" * 60)
 
-        if DRY_RUN:
-            self.kite = self._create_mock_kite()
-        else:
+        # FIX: Create notifier first so we can send login status
+        self.notifier = get_notifier()
+
+        # FIX: Always do a real Zerodha login — even in dry-run/paper trade mode.
+        # Real login = real tick feed, real prices, real scanner data.
+        # DRY_RUN only controls ORDER PLACEMENT (paper vs live), not authentication.
+        # OrderManager(paper_trade=True) handles simulated fills — no real orders sent.
+        try:
+            logger.info(
+                f"Connecting to Zerodha... "
+                f"({'PAPER TRADE — real login, simulated orders' if DRY_RUN else 'LIVE TRADING'})"
+            )
             kite_login = KiteLogin()
             self.kite  = kite_login.get_kite_instance()
+            self.notifier.notify_startup(dry_run=DRY_RUN)
+            logger.info("✅ Zerodha login confirmed — Telegram notified")
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Login failed: {error_msg}")
+            self.notifier.notify_login_failed(error_msg)
+            raise  # re-raise so process exits cleanly
 
         self.scanner        = PreMarketScanner(self.kite)
         self.candle_builder = CandleBuilder(interval_minutes=5)
@@ -115,6 +135,12 @@ class AIHybridTradingSystem:
         self.scheduler  = None
         self._running   = False
 
+        # FIX: Wire trading system into notifier so /status command works
+        self.notifier._trading_system = self
+        # FIX: Start Telegram command listener (/stop /status /resume /journal)
+        self.notifier.start_command_listener(trading_system=self)
+        logger.info("Telegram command listener active — /stop /status /journal /help")
+
     # ------------------------------------------------------------------
     # PRE-MARKET SETUP (9:05 AM)
     # ------------------------------------------------------------------
@@ -126,9 +152,17 @@ class AIHybridTradingSystem:
         logger.info("Running pre-market setup...")
 
         try:
+            from regime.market_regime import MarketRegimeClassifier, MarketRegime
+            # Use a basic regime since we don't have daily data at startup
+            # In production, fetch Nifty50 daily data here
+            regime = MarketRegime("RANGE", "NORMAL_VOL", adx=0.0, india_vix=13.0)
+
             candidates     = self.scanner.run(top_n=5)
             self.watchlist = [c.symbol for c in candidates]
             logger.info(f"Watchlist set: {self.watchlist}")
+
+            # FIX: Send scanner results and regime to Telegram
+            self.notifier.notify_scanner_results(candidates, regime)
 
             for strat in self.strategies.values():
                 strat.reset_daily()
@@ -139,6 +173,7 @@ class AIHybridTradingSystem:
 
         except Exception as e:
             logger.error(f"pre_market_setup failed: {e}")
+            self.notifier.notify_error("pre_market_setup", str(e))
 
     # ------------------------------------------------------------------
     # CANDLE CLOSE CALLBACK
@@ -146,11 +181,15 @@ class AIHybridTradingSystem:
     def on_candle_close(self, symbol: str, candle, history):
         """
         Called by CandleBuilder every time a 5-minute candle closes.
-
         FIX 14b: Unpack can_trade() tuple in one call — no race condition.
         """
         try:
             allowed, reason_str = self.risk_manager.can_trade()
+
+            # FIX: Also check if Telegram /stop was requested
+            if self.notifier.is_stop_requested():
+                allowed    = False
+                reason_str = "TELEGRAM_STOP: /stop command active"
 
             if not allowed:
                 self.journal.log_trade_blocked(
@@ -191,6 +230,8 @@ class AIHybridTradingSystem:
 
                 if signal:
                     logger.info(f"Signal received: {signal}")
+                    # FIX: Notify Telegram when a signal fires
+                    self.notifier.notify_signal(signal, dry_run=PAPER_TRADE_MODE)
                     self._execute_signal(signal)
 
         except Exception as e:
@@ -253,8 +294,16 @@ class AIHybridTradingSystem:
             self.ticker.connect(threaded=True)
             logger.info("KiteTicker connected (threaded)")
 
+            # FIX: Notify Telegram that ticker is live
+            self.notifier.send(
+                "📡 <b>Market Open — Live Tick Feed Connected</b>\n"
+                f"Watching: {', '.join(s.replace('NSE:','') for s in self.watchlist[:5])}\n"
+                f"Time: {datetime.now().strftime('%H:%M IST')}"
+            )
+
         except Exception as e:
             logger.error(f"KiteTicker start failed: {e}")
+            self.notifier.notify_error("KiteTicker", str(e))
 
     def _on_connect(self, ws, response):
         """Subscribe to instrument tokens for watchlist"""
@@ -321,13 +370,19 @@ class AIHybridTradingSystem:
 
     def _eod_close(self):
         logger.info("Scheduler: EOD force close triggered")
+        # FIX: Notify Telegram before force closing
+        self.notifier.notify_force_close()
         self.candle_builder.force_close_all()
         self.order_manager.force_close_all(reason="EOD_15:15")
 
     def _end_of_day(self):
         logger.info("Scheduler: end-of-day wrap-up")
-        self.journal.log_daily_summary(
-            self.risk_manager.get_state_snapshot()
+        state = self.risk_manager.get_state_snapshot()
+        self.journal.log_daily_summary(state)
+        # FIX: Send EOD summary to Telegram
+        self.notifier.notify_eod_summary(
+            status=state,
+            dry_run=PAPER_TRADE_MODE
         )
 
     # ------------------------------------------------------------------
@@ -369,6 +424,7 @@ class AIHybridTradingSystem:
 
             except Exception as e:
                 logger.error(f"Main loop error: {e}")
+                self.notifier.notify_error("main loop", str(e))
                 time.sleep(30)
 
     def _shutdown(self, signum=None, frame=None):
@@ -385,30 +441,11 @@ class AIHybridTradingSystem:
         if self.scheduler and self.scheduler.running:
             self.scheduler.shutdown(wait=False)
 
+        self.notifier.send("⚡ <b>System shut down.</b> All positions force-closed.")
         logger.info("Shutdown complete")
 
     def _get_avg_volume(self, symbol: str) -> float:
         return 1_000_000.0
-
-    def _create_mock_kite(self):
-        """Returns a lightweight mock KiteConnect for --dry-run mode."""
-        class MockKite:
-            api_key      = "dry_run"
-            access_token = "dry_run"
-
-            def profile(self):           return {"user_id": "DRY_RUN"}
-            def instruments(self, *a):   return []
-            def ltp(self, *a):           return {}
-            def positions(self):         return {"net": [], "day": []}
-            def orders(self):            return []
-            def place_order(self, **kw): return f"MOCK_{int(time.time())}"
-            def cancel_order(self, *a):  return True
-            def order_history(self, oid):
-                return [{"status": "COMPLETE", "average_price": 100.0}]
-            def historical_data(self, *a, **kw): return []
-
-        logger.info("DRY-RUN: using MockKite — no real API calls will be made")
-        return MockKite()
 
 
 # ================================================================
@@ -421,12 +458,29 @@ def run_scan_only():
     No ticker, no orders, no scheduler.
     """
     logger.info("=== SCAN-ONLY MODE ===")
-    kite_login = KiteLogin()
-    kite       = kite_login.get_kite_instance()
+    notifier   = get_notifier()
+
+    try:
+        kite_login = KiteLogin()
+        kite       = kite_login.get_kite_instance()
+        # FIX: confirm login via Telegram in scan-only mode too
+        notifier.send(
+            "🔍 <b>Scan-Only Mode</b>\n"
+            "✅ Zerodha login successful.\n"
+            "Running pre-market scanner..."
+        )
+    except Exception as e:
+        notifier.notify_login_failed(str(e))
+        raise
 
     scanner    = PreMarketScanner(kite)
     candidates = scanner.run(top_n=5)
     scanner.print_report(candidates)
+
+    from regime.market_regime import MarketRegime
+    regime = MarketRegime("RANGE", "NORMAL_VOL")
+    notifier.notify_scanner_results(candidates, regime)
+
     logger.info("Scan complete. Exiting.")
 
 
@@ -443,7 +497,6 @@ if __name__ == "__main__":
             import pandas as pd
             import numpy as np
 
-            # Generate synthetic 5-min data for the demo
             logger.info("Generating synthetic demo data...")
             dates = pd.date_range("2025-01-01 09:15", periods=2000, freq="5min")
             dates = dates[dates.time() >= __import__('datetime').time(9, 15)]

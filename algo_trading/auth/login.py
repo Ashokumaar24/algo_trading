@@ -2,15 +2,18 @@
 #  auth/login.py
 #  Zerodha KiteConnect login with Telegram OTP fallback
 #
-#  Critical: must use kite.zerodha.com/connect/login?api_key=...
-#  NOT kite.zerodha.com — the /connect/login URL is what
-#  generates the request_token after TOTP.
+#  FIX (StaleElementReferenceException):
+#    After send_keys(otp), Zerodha's page re-renders the OTP field
+#    (DOM node is replaced). The saved totp_field reference goes stale,
+#    so totp_field.send_keys(Keys.RETURN) raises StaleElementReferenceException.
 #
-#  FIX (startup crash): Added KiteLogin class.
-#    - main.py does `from auth.login import KiteLogin` and calls
-#      kite_login.get_kite_instance().
-#    - No such class existed → ImportError on every startup.
-#    - KiteLogin is now a thin class wrapper around get_kite_session().
+#    Fix applied in TWO places (primary OTP entry + Telegram fallback):
+#      1. Wrap send_keys(Keys.RETURN) in try/except — if stale, re-find
+#         the field and send RETURN on the fresh element.
+#      2. Also wrap the submit button click in a separate try/except so
+#         either path (RETURN or button click) can succeed independently.
+#      3. Added a short wait after send_keys(otp) to give the page time
+#         to process digits before the stale check.
 # ============================================================
 
 import os
@@ -86,15 +89,14 @@ def _wait_for_telegram_otp(token: str, chat_id: str,
                              timeout_seconds: int = 120) -> str | None:
     """
     Poll Telegram for a NEW 6-digit reply.
-    Only processes messages with update_id > start_update_id
-    (messages that arrived AFTER we sent the OTP request).
+    Only processes messages with update_id > start_update_id.
     """
     if not token or not chat_id:
         return None
 
     logger.info("Waiting for OTP via Telegram...")
     start_time  = time.time()
-    last_update = start_update_id  # only look at messages AFTER this
+    last_update = start_update_id
 
     while (time.time() - start_time) < timeout_seconds:
         remaining = int(timeout_seconds - (time.time() - start_time))
@@ -166,15 +168,54 @@ def _find_totp_field(driver, timeout=30):
     )
 
 
+def _submit_otp(driver, totp_field, otp: str):
+    """
+    FIX: Enter OTP digits then submit — handles StaleElementReferenceException.
+
+    After send_keys(otp), Zerodha's React page may re-render the field.
+    The saved element reference goes stale before Keys.RETURN is sent.
+
+    Strategy:
+      1. Type the digits into the current reference.
+      2. Brief pause so the page can process.
+      3. Attempt Keys.RETURN on the SAME reference (fast path).
+      4. If that raises StaleElementReferenceException, re-find the field
+         and send RETURN on the fresh element.
+      5. Fall through to submit button click as a final fallback.
+    """
+    logger.info(f"Entering OTP: {otp}")
+    totp_field.clear()
+    totp_field.send_keys(otp)
+    time.sleep(0.5)   # give React time to process the digits
+
+    # Step 3: Try RETURN on existing reference
+    try:
+        totp_field.send_keys(Keys.RETURN)
+        logger.info("OTP submitted via Keys.RETURN (original element)")
+    except Exception:
+        # Step 4: Element went stale — re-find and retry RETURN
+        logger.info("OTP field went stale after digits — re-finding for RETURN")
+        try:
+            fresh_field = _find_totp_field(driver, timeout=5)
+            fresh_field.send_keys(Keys.RETURN)
+            logger.info("OTP submitted via Keys.RETURN (re-found element)")
+        except Exception as e:
+            logger.info(f"RETURN key failed ({e}) — trying submit button")
+
+    # Step 5: Final fallback — click the submit button
+    try:
+        driver.find_element(By.XPATH, "//button[@type='submit']").click()
+        logger.info("Submit button clicked")
+    except Exception:
+        pass  # already submitted via RETURN — this is fine
+
+
 # ----------------------------------------------------------------
 # MAIN LOGIN
 # ----------------------------------------------------------------
 def login(headless: bool = True) -> str:
     """
     Log into Zerodha via KiteConnect API flow and return the access token.
-
-    IMPORTANT: Must use /connect/login?api_key= URL, NOT kite.zerodha.com directly.
-    Only the /connect/login flow generates the request_token in the redirect URL.
     """
     creds = _load_credentials()
 
@@ -255,16 +296,8 @@ def login(headless: bool = True) -> str:
             if not otp:
                 raise TimeoutError("Login failed: No OTP received from Telegram within 120 seconds.")
 
-        # ── Step 5: Enter OTP ─────────────────────────────────────────
-        logger.info(f"Entering OTP: {otp}")
-        totp_field.clear()
-        totp_field.send_keys(otp)
-        time.sleep(0.3)
-        totp_field.send_keys(Keys.RETURN)
-        try:
-            driver.find_element(By.XPATH, "//button[@type='submit']").click()
-        except Exception:
-            pass
+        # ── Step 5: Enter OTP (FIX: stale element handled) ───────────
+        _submit_otp(driver, totp_field, otp)
 
         # ── Step 6: Wait for redirect with request_token ─────────────
         logger.info("Waiting for KiteConnect redirect with request_token...")
@@ -299,26 +332,13 @@ def login(headless: bool = True) -> str:
                 "⏳ You have <b>90 seconds</b>."
             )
 
-            try:
-                totp_field = _find_totp_field(driver, timeout=5)
-                totp_field.clear()
-            except Exception:
-                pass
-
             user_otp = _wait_for_telegram_otp(tg_token, tg_chat_id, tg_offset, timeout_seconds=90)
             if not user_otp:
                 raise TimeoutError("Login failed: No OTP received via Telegram within 90 seconds.")
 
-            totp_field = _find_totp_field(driver, timeout=15)
-            totp_field.clear()
-            totp_field.send_keys(user_otp)
-            totp_field.send_keys(Keys.RETURN)
-            logger.info(f"Telegram OTP entered: {user_otp}")
-
-            try:
-                driver.find_element(By.XPATH, "//button[@type='submit']").click()
-            except Exception:
-                pass
+            # FIX: Use _submit_otp() here too — not raw send_keys
+            totp_field_retry = _find_totp_field(driver, timeout=15)
+            _submit_otp(driver, totp_field_retry, user_otp)
 
             deadline2 = time.time() + 40
             while time.time() < deadline2:
@@ -377,15 +397,7 @@ def load_credentials() -> dict:
 
 
 # ----------------------------------------------------------------
-# FIX: KiteLogin class — was missing, causing ImportError in main.py
-#
-# main.py does:
-#   from auth.login import KiteLogin
-#   kite_login = KiteLogin()
-#   self.kite = kite_login.get_kite_instance()
-#
-# Previously this raised ImportError immediately on startup.
-# KiteLogin is now a thin class wrapper around get_kite_session().
+# KiteLogin class — class-based wrapper for main.py
 # ----------------------------------------------------------------
 class KiteLogin:
     """
@@ -403,8 +415,7 @@ class KiteLogin:
     def get_kite_instance(self):
         """
         Perform login and return an authenticated KiteConnect instance.
-        Caches the result so get_kite_instance() is idempotent within
-        the same session.
+        Caches the result so get_kite_instance() is idempotent.
         """
         if self._kite is None:
             logger.info("KiteLogin: initiating Zerodha authentication...")
