@@ -2,6 +2,20 @@
 #  strategies/ai_hybrid.py
 #  AI Hybrid Strategy — Regime-aware meta-strategy selector
 #
+#  BUG FIX (Critical): set_orb() signature corrected.
+#    main.py calls: self.ai_hybrid.set_orb(symbol, opening_candles)
+#    Old code had:  def set_orb(self, symbol, candle_915, candle_930)
+#    This caused TypeError every time the ORB was set — ORB strategy
+#    NEVER fired in paper trading because of this mismatch.
+#    Fixed to: def set_orb(self, symbol, opening_candles: list)
+#    which correctly passes the list down to ORBStrategy.set_orb().
+#
+#  BUG FIX: Added reset_daily() to AIHybridStrategy itself.
+#    main.py._daily_reset() called individual sub-strategy resets
+#    but never cleared _regime_blocked_logged_today. If the system
+#    ran for multiple days, yesterday's regime-blocked symbols would
+#    suppress today's journal entries. Now handled in reset_daily().
+#
 #  ADDED: journal logging when regime or sentiment blocks strategies
 # ============================================================
 
@@ -14,7 +28,7 @@ from strategies.orb_strategy import ORBStrategy
 from strategies.vwap_pullback import VWAPPullbackStrategy
 from strategies.breakout_atr import BreakoutATRStrategy
 from regime.market_regime import MarketRegimeClassifier, MarketRegime
-from utils.daily_journal import get_journal          # ← ADDED
+from utils.daily_journal import get_journal
 from utils.logger import get_logger
 
 logger = get_logger("ai_hybrid")
@@ -34,7 +48,7 @@ class AIHybridStrategy:
 
         self.regime_classifier  = MarketRegimeClassifier()
         self._current_regime: Optional[MarketRegime] = None
-        self._regime_blocked_logged_today: set = set()   # avoid duplicate logs
+        self._regime_blocked_logged_today: set = set()
 
     def setup_day(self, nifty_daily: pd.DataFrame, india_vix: float = 0.0,
                   prev_day_data: dict = None):
@@ -52,8 +66,45 @@ class AIHybridStrategy:
                     symbol, data['high'], data['low'], data['close']
                 )
 
-    def set_orb(self, symbol: str, candle_915: dict, candle_930: dict):
-        self.orb.set_orb(symbol, candle_915, candle_930)
+    # ------------------------------------------------------------------
+    # BUG FIX: Correct signature — takes opening_candles list, not two dicts
+    # ------------------------------------------------------------------
+    def set_orb(self, symbol: str, opening_candles: list):
+        """
+        Set the Opening Range for a symbol.
+
+        Args:
+            symbol:          e.g. "NSE:RELIANCE"
+            opening_candles: List of candle dicts from 9:15–9:25
+                             (the first 3 five-minute candles of the day).
+
+        BUG FIX: Old signature was set_orb(self, symbol, candle_915, candle_930)
+        but main.py calls set_orb(symbol, opening_candles) passing ONE list.
+        This caused TypeError on every call → ORB strategy never fired.
+        """
+        if not opening_candles:
+            logger.warning(f"set_orb: empty candles list for {symbol}")
+            return
+        self.orb.set_orb(symbol, opening_candles)
+
+    # ------------------------------------------------------------------
+    # BUG FIX: Add reset_daily() to clear ai_hybrid state properly
+    # ------------------------------------------------------------------
+    def reset_daily(self):
+        """
+        Reset all per-day state.
+
+        BUG FIX: main.py._daily_reset() called sub-strategy resets individually
+        but never cleared _regime_blocked_logged_today on AIHybridStrategy itself.
+        Over multiple trading days this caused stale regime-block suppression.
+        Now main.py can call ai_hybrid.reset_daily() for a complete reset.
+        """
+        self.orb.reset_daily()
+        self.vwap.reset_daily()
+        self.breakout.reset_daily()
+        self._regime_blocked_logged_today.clear()
+        self._current_regime = None
+        logger.info("AIHybridStrategy: daily reset complete")
 
     def get_signal(self, symbol: str,
                    candle: dict,
@@ -75,7 +126,7 @@ class AIHybridStrategy:
 
         candle_price = candle.get('close', 0)
 
-        # ADDED: log regime-blocked once per day (not every candle)
+        # Log regime-blocked once per symbol per day (not every candle)
         if not regime.is_tradeable:
             if symbol not in self._regime_blocked_logged_today:
                 get_journal().log_trade_blocked(
@@ -98,7 +149,6 @@ class AIHybridStrategy:
         eligible_strategy_names = self.regime_classifier.get_eligible_strategies(regime)
 
         if not eligible_strategy_names:
-            # ADDED: log no eligible strategies
             if f"no_strat_{symbol}" not in self._regime_blocked_logged_today:
                 get_journal().log_trade_blocked(
                     symbol=symbol,
@@ -119,7 +169,7 @@ class AIHybridStrategy:
             eligible_strategy_names, sentiment_score, regime
         )
 
-        # ADDED: log sentiment-blocked strategies
+        # Log sentiment-blocked strategies (once per symbol+strategy)
         blocked_by_sentiment = set(eligible_strategy_names) - set(filtered_strategies)
         for strat in blocked_by_sentiment:
             key = f"sentiment_{symbol}_{strat}"

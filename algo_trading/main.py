@@ -1,45 +1,34 @@
 # ============================================================
 #  main.py  — AI Hybrid Algo Trading System
 #
-#  FIXES in this version:
+#  BUGS FIXED IN THIS VERSION:
 #
-#  BUG 1 FIXED: AIHybridStrategy now used instead of individual strategies.
-#    - Individual strategies dict replaced with self.ai_hybrid.
-#    - Regime filtering, sentiment gate, and strategy selection are all
-#      handled inside AIHybridStrategy as designed.
-#    - EMA_RSI (retired) can no longer fire.
+#  BUG 1–10 (previous sessions): see inline comments
 #
-#  BUG 2 FIXED: Real regime classification — MarketRegimeClassifier now
-#    called with actual 300-day Nifty50 daily OHLCV data every morning.
-#    No more hardcoded RANGE/NORMAL_VOL.
+#  BUG 11 FIXED: _get_avg_volume() was always returning 1_000_000.
+#    Now caches real 20-day average volume per symbol during
+#    pre_market_setup(). Affects ORB volume filter and Breakout ATR —
+#    both now work with stock-specific volume thresholds.
 #
-#  BUG 3 FIXED: India VIX now fetched live from Zerodha at 9:05 AM.
-#    Position sizing and circuit breakers now respond to real fear levels.
+#  BUG 12 FIXED: Paper trade SL/target never triggered intraday.
+#    order_manager.check_paper_exits() is now called at the start of
+#    on_candle_close() for every open paper position. Without this,
+#    ALL paper trades closed at EOD (win rate = meaningless).
 #
-#  BUG 4 FIXED: set_orb() is now called in on_candle_close() after the
-#    9:30 candle closes for each symbol. Extracts 9:15, 9:20, 9:25
-#    candles from history and passes them to ai_hybrid.set_orb().
-#    ORB strategy can now fire for the first time.
+#  BUG 13 FIXED: on_exit_callback wired into OrderManager.
+#    When a paper position closes (SL/target/EOD), the callback
+#    now updates risk_manager (record_trade_exit) and daily_journal
+#    (log_trade_exit) so daily P&L and win/loss counts are correct.
 #
-#  BUG 5 FIXED: _daily_reset() now clears self.watchlist = [] so
-#    pre_market_setup() runs every morning (not just Day 1).
-#    Also resets self._orb_set, self._nifty_daily, self._india_vix.
+#  BUG 14 FIXED: regime not passed to notify_eod_summary.
+#    state dict now includes 'regime' key before calling notify.
 #
-#  BUG 6 FIXED: EOD Telegram summary now shows real win/loss count
-#    sourced from DailyJournal exit log (not risk manager snapshot).
-#
-#  BUG 7 FIXED: DailyJournal.generate_report() called in _end_of_day().
-#    Journal markdown file path passed to notify_eod_summary() so
-#    the full journal is attached to the Telegram EOD message.
-#
-#  BUG 10 FIXED: DailyJournal wired into main trading flow.
-#    log_regime() called after regime classification.
-#    log_scanner_results() called after scanner.run().
-#    generate_report() called at 3:30 PM.
+#  BUG 15 FIXED: ai_hybrid.reset_daily() called properly.
+#    Old code called sub-strategy resets individually but never
+#    cleared AIHybridStrategy._regime_blocked_logged_today.
 #
 #  TELEGRAM + STARTUP (previous session):
-#    Notifier created before login, command listener started,
-#    all key events send Telegram messages.
+#    Notifier created before login, command listener started.
 # ============================================================
 
 import sys
@@ -49,18 +38,14 @@ import time
 import argparse
 import pandas as pd
 from datetime import datetime, time as t, timedelta
-from typing import Optional
+from typing import Optional, Dict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# ── Parse CLI flags ───────────────────────────────────────────────
 _parser = argparse.ArgumentParser(description="AI Hybrid Algo Trading System")
-_parser.add_argument('--dry-run',   action='store_true', default=False,
-                     help="Paper trade mode — real login, simulated orders")
-_parser.add_argument('--backtest',  action='store_true', default=False,
-                     help="Run demo backtest on synthetic data and exit")
-_parser.add_argument('--scan-only', action='store_true', default=False,
-                     help="Run pre-market scanner only and exit")
+_parser.add_argument('--dry-run',   action='store_true', default=False)
+_parser.add_argument('--backtest',  action='store_true', default=False)
+_parser.add_argument('--scan-only', action='store_true', default=False)
 _args = _parser.parse_args()
 
 DRY_RUN   = _args.dry_run
@@ -76,14 +61,12 @@ from zoneinfo import ZoneInfo
 
 from auth.login import KiteLogin
 from scanner.pre_market_scanner import PreMarketScanner
-# BUG 1 FIX: Use AIHybridStrategy — not individual strategies
 from strategies.ai_hybrid import AIHybridStrategy
 from regime.market_regime import MarketRegimeClassifier, MarketRegime
 from utils.candle_builder import CandleBuilder
 from execution.order_manager import OrderManager
 from risk.risk_manager import RiskManager
 from utils.journal import TradeJournal
-# BUG 10 FIX: Wire DailyJournal
 from utils.daily_journal import get_journal as get_daily_journal, reset_journal
 from utils.telegram_notifier import get_notifier
 from config.config import (
@@ -99,9 +82,6 @@ logger = get_logger("main")
 IST    = ZoneInfo("Asia/Kolkata")
 
 
-# ================================================================
-#  AI HYBRID TRADING SYSTEM
-# ================================================================
 class AIHybridTradingSystem:
 
     def __init__(self):
@@ -109,78 +89,112 @@ class AIHybridTradingSystem:
         logger.info("  AI HYBRID TRADING SYSTEM — Starting up")
         logger.info("=" * 60)
 
-        # Create notifier first — so login failures can be reported
         self.notifier = get_notifier()
 
-        # Always do a real Zerodha login — even in dry-run.
-        # DRY_RUN only controls ORDER PLACEMENT, not authentication.
-        # Real login = real tick data, real prices, real scanner.
         try:
             logger.info(
                 f"Connecting to Zerodha... "
-                f"({'PAPER TRADE — real login, simulated orders' if DRY_RUN else 'LIVE TRADING'})"
+                f"({'PAPER TRADE' if DRY_RUN else 'LIVE TRADING'})"
             )
             kite_login = KiteLogin()
             self.kite  = kite_login.get_kite_instance()
             self.notifier.notify_startup(dry_run=DRY_RUN)
-            logger.info("✅ Zerodha login confirmed — Telegram notified")
         except Exception as e:
-            error_msg = str(e)
-            logger.error(f"Login failed: {error_msg}")
-            self.notifier.notify_login_failed(error_msg)
+            self.notifier.notify_login_failed(str(e))
             raise
 
         self.scanner        = PreMarketScanner(self.kite)
         self.candle_builder = CandleBuilder(interval_minutes=5)
-        self.order_manager  = OrderManager(self.kite, paper_trade=PAPER_TRADE_MODE)
         self.risk_manager   = RiskManager(capital=INITIAL_CAPITAL)
         self.journal        = TradeJournal()
 
-        # BUG 1 FIX: Single AIHybridStrategy instead of 4 individual strategies.
-        # AIHybrid handles: regime selection, sentiment gate, EMA_RSI exclusion.
+        # BUG 13 FIX: Wire on_exit_callback so paper exits update risk+journal
+        self.order_manager  = OrderManager(
+            self.kite,
+            paper_trade=PAPER_TRADE_MODE,
+            on_exit_callback=self._on_trade_exit
+        )
+
         self.ai_hybrid = AIHybridStrategy()
 
         self.watchlist        = []
         self.ticker           = None
         self.scheduler        = None
         self._running         = False
-
-        # BUG 4 FIX: Track which symbols have had set_orb() called today
         self._orb_set: set    = set()
 
-        # BUG 2+3 FIX: Cache Nifty daily data and VIX for intraday use
         self._nifty_daily: Optional[pd.DataFrame] = None
-        self._india_vix: float                    = 15.0  # safe default
+        self._india_vix: float                    = 15.0
         self._current_regime: Optional[MarketRegime] = None
 
-        # BUG 10 FIX: DailyJournal instance (reset each morning)
+        # BUG 11 FIX: Cache real avg volumes per symbol
+        self._avg_volumes: Dict[str, float] = {}
+
         self.daily_journal = get_daily_journal()
 
-        # Wire Telegram command listener
         self.notifier._trading_system = self
         self.notifier.start_command_listener(trading_system=self)
-        logger.info("Telegram command listener active — /stop /status /journal /help")
+
+    # ------------------------------------------------------------------
+    # BUG 13 FIX: Exit callback — updates risk_manager + daily_journal
+    # ------------------------------------------------------------------
+    def _on_trade_exit(self, symbol: str, pnl: float, exit_reason: str,
+                       exit_price: float, hold_mins: int, order_info: dict):
+        """
+        Called when any position closes (paper SL/target/EOD, or real).
+        Updates risk_manager daily P&L and daily_journal exit log.
+        Also notifies Telegram.
+        """
+        self.risk_manager.record_trade_exit(pnl)
+
+        direction  = order_info.get('direction', '')
+        entry      = order_info.get('entry_price', 0)
+        strategy   = order_info.get('strategy', 'UNKNOWN')
+
+        self.daily_journal.log_trade_exit(
+            symbol=symbol,
+            strategy=strategy,
+            direction=direction,
+            entry=entry,
+            exit_price=exit_price,
+            exit_reason=exit_reason,
+            pnl=pnl,
+            hold_mins=hold_mins,
+        )
+
+        self.notifier.notify_trade_exit(
+            symbol=symbol,
+            pnl=pnl,
+            exit_reason=exit_reason,
+            entry=entry,
+            exit_price=exit_price,
+            hold_mins=hold_mins,
+        )
+
+        logger.info(
+            f"Trade exit processed | {symbol} {direction} | "
+            f"PnL:₹{pnl:+,.0f} | Reason:{exit_reason}"
+        )
 
     # ------------------------------------------------------------------
     # PRE-MARKET SETUP (9:05 AM)
-    # BUG 2+3+10 FIX: Fetch real VIX + Nifty daily, classify regime properly
     # ------------------------------------------------------------------
     def pre_market_setup(self):
         logger.info("Running pre-market setup...")
 
         try:
-            # ── BUG 3 FIX: Fetch live India VIX ─────────────────────
+            # BUG 3 FIX: Fetch live India VIX
             try:
-                vix_data       = self.kite.ltp(["NSE:INDIA VIX"])
+                vix_data        = self.kite.ltp(["NSE:INDIA VIX"])
                 self._india_vix = float(vix_data["NSE:INDIA VIX"]["last_price"])
                 logger.info(f"India VIX: {self._india_vix:.2f}")
             except Exception as e:
-                logger.warning(f"VIX fetch failed ({e}) — using default {self._india_vix:.1f}")
+                logger.warning(f"VIX fetch failed ({e}) — using {self._india_vix:.1f}")
 
-            # ── BUG 2 FIX: Fetch Nifty50 daily OHLCV (300 days) ─────
+            # BUG 2 FIX: Fetch Nifty50 daily OHLCV (300 days)
             self._nifty_daily = self._fetch_nifty_daily()
 
-            # ── BUG 2 FIX: Classify real market regime ───────────────
+            # BUG 2 FIX: Classify real market regime
             classifier = MarketRegimeClassifier()
             if self._nifty_daily is not None and len(self._nifty_daily) >= 200:
                 self._current_regime = classifier.classify(
@@ -188,9 +202,7 @@ class AIHybridTradingSystem:
                 )
                 eligible = classifier.get_eligible_strategies(self._current_regime)
             else:
-                logger.warning(
-                    "Insufficient Nifty daily data — defaulting to RANGE/NORMAL_VOL"
-                )
+                logger.warning("Insufficient Nifty daily data — defaulting RANGE/NORMAL_VOL")
                 self._current_regime = MarketRegime(
                     "RANGE", "NORMAL_VOL",
                     adx=0.0, india_vix=self._india_vix
@@ -199,13 +211,13 @@ class AIHybridTradingSystem:
 
             logger.info(f"Regime: {self._current_regime}")
 
-            # ── Run pre-market scanner ────────────────────────────────
             candidates     = self.scanner.run(top_n=5)
             self.watchlist = [c.symbol for c in candidates]
             logger.info(f"Watchlist: {self.watchlist}")
 
-            # ── BUG 1 FIX: Setup AIHybridStrategy with today's regime ─
-            # Pass previous day data for Breakout ATR strategy
+            # BUG 11 FIX: Cache real avg volumes for watchlist symbols
+            self._cache_avg_volumes()
+
             prev_day_data = self._build_prev_day_data()
             self.ai_hybrid.setup_day(
                 nifty_daily=self._nifty_daily if self._nifty_daily is not None
@@ -214,23 +226,18 @@ class AIHybridTradingSystem:
                 prev_day_data=prev_day_data
             )
 
-            # ── BUG 10 FIX: Log to DailyJournal ─────────────────────
+            # BUG 10 FIX: Log to DailyJournal
             self.daily_journal.log_regime(self._current_regime, eligible)
             self.daily_journal.log_scanner_results(candidates)
-            self.daily_journal.add_note(
-                f"India VIX at open: {self._india_vix:.2f}"
-            )
+            self.daily_journal.add_note(f"India VIX at open: {self._india_vix:.2f}")
 
-            # ── Notify Telegram ───────────────────────────────────────
             self.notifier.notify_scanner_results(candidates, self._current_regime)
 
-            # ── Reset per-day state ───────────────────────────────────
             self.candle_builder.reset_daily()
             self.risk_manager.reset_daily()
             self.candle_builder.set_callback(self.on_candle_close)
             self._orb_set.clear()
 
-            # ── Notify if regime blocks trading ──────────────────────
             if not self._current_regime.is_tradeable:
                 self.notifier.notify_regime_blocked(self._current_regime)
 
@@ -239,18 +246,62 @@ class AIHybridTradingSystem:
             self.notifier.notify_error("pre_market_setup", str(e))
 
     # ------------------------------------------------------------------
-    # BUG 2 FIX: Fetch Nifty50 daily OHLCV from Zerodha
+    # BUG 11 FIX: Cache real 20-day average volumes per symbol
+    # ------------------------------------------------------------------
+    def _cache_avg_volumes(self):
+        """
+        Fetch 25 days of daily data for each watchlist symbol and compute
+        the 20-day average volume. Stored in self._avg_volumes.
+
+        Previously _get_avg_volume() always returned 1_000_000 (hardcoded TODO).
+        This made ORB volume filter and Breakout ATR use the same volume
+        threshold for all stocks regardless of their actual traded volumes.
+        E.g. RELIANCE trades ~8M shares/day; DIVISLAB trades ~300K.
+        """
+        logger.info("Caching 20-day avg volumes for watchlist...")
+        self._avg_volumes.clear()
+
+        for symbol in self.watchlist:
+            try:
+                instruments = self.kite.instruments("NSE")
+                inst_df     = pd.DataFrame(instruments)
+                clean       = symbol.replace("NSE:", "")
+                row         = inst_df[inst_df['tradingsymbol'] == clean]
+                if row.empty:
+                    continue
+
+                token   = int(row.iloc[0]['instrument_token'])
+                to_dt   = datetime.now()
+                from_dt = to_dt - timedelta(days=30)
+                hist    = self.kite.historical_data(token, from_dt, to_dt, 'day')
+
+                if hist and len(hist) >= 5:
+                    df      = pd.DataFrame(hist)
+                    avg_vol = float(df['volume'].tail(20).mean())
+                    self._avg_volumes[symbol] = avg_vol
+                    logger.info(f"  {clean}: avg_vol = {avg_vol:,.0f}")
+
+            except Exception as e:
+                logger.debug(f"avg_volume fetch failed for {symbol}: {e}")
+
+        logger.info(f"Avg volumes cached for {len(self._avg_volumes)} symbols ✓")
+
+    def _get_avg_volume(self, symbol: str) -> float:
+        """
+        BUG 11 FIX: Returns real cached avg volume instead of hardcoded 1M.
+        Falls back to 1M only if not yet cached (pre-market not run yet).
+        """
+        return self._avg_volumes.get(symbol, 1_000_000.0)
+
+    # ------------------------------------------------------------------
+    # NIFTY DAILY DATA FETCH
     # ------------------------------------------------------------------
     def _fetch_nifty_daily(self) -> Optional[pd.DataFrame]:
-        """Fetch 300 days of Nifty50 daily OHLCV for regime classification."""
         try:
             instruments = self.kite.instruments("NSE")
             inst_df     = pd.DataFrame(instruments)
-
-            # Nifty 50 index
-            row = inst_df[inst_df['tradingsymbol'] == 'NIFTY 50']
+            row         = inst_df[inst_df['tradingsymbol'] == 'NIFTY 50']
             if row.empty:
-                logger.warning("NIFTY 50 instrument not found in NSE master")
                 return None
 
             token     = int(row.iloc[0]['instrument_token'])
@@ -265,7 +316,6 @@ class AIHybridTradingSystem:
             df.rename(columns={'date': 'timestamp'}, inplace=True)
             df.set_index('timestamp', inplace=True)
             df.sort_index(inplace=True)
-
             logger.info(f"Nifty daily data: {len(df)} bars loaded ✓")
             return df
 
@@ -273,11 +323,7 @@ class AIHybridTradingSystem:
             logger.warning(f"Nifty daily fetch failed: {e}")
             return None
 
-    # ------------------------------------------------------------------
-    # Helper: build prev_day_data for BreakoutATR strategy
-    # ------------------------------------------------------------------
     def _build_prev_day_data(self) -> dict:
-        """Fetch previous day OHLC for each watchlist stock."""
         prev_data = {}
         for symbol in self.watchlist:
             try:
@@ -287,16 +333,14 @@ class AIHybridTradingSystem:
                 row         = inst_df[inst_df['tradingsymbol'] == clean]
                 if row.empty:
                     continue
-                token  = int(row.iloc[0]['instrument_token'])
-                to_dt  = datetime.now()
+                token   = int(row.iloc[0]['instrument_token'])
+                to_dt   = datetime.now()
                 from_dt = to_dt - timedelta(days=5)
-                hist   = self.kite.historical_data(token, from_dt, to_dt, 'day')
+                hist    = self.kite.historical_data(token, from_dt, to_dt, 'day')
                 if hist and len(hist) >= 2:
-                    prev = hist[-2]  # yesterday
+                    prev = hist[-2]
                     prev_data[symbol] = {
-                        'high':  prev['high'],
-                        'low':   prev['low'],
-                        'close': prev['close'],
+                        'high': prev['high'], 'low': prev['low'], 'close': prev['close'],
                     }
             except Exception as e:
                 logger.debug(f"prev_day_data failed for {symbol}: {e}")
@@ -304,11 +348,23 @@ class AIHybridTradingSystem:
 
     # ------------------------------------------------------------------
     # CANDLE CLOSE CALLBACK
-    # BUG 1+4 FIX: Use AIHybridStrategy and call set_orb() when ready
     # ------------------------------------------------------------------
     def on_candle_close(self, symbol: str, candle, history):
         try:
-            # ── BUG 4 FIX: Set ORB after first 9:30 candle ───────────
+            candle_dict = candle.to_dict()
+
+            # BUG 12 FIX: Check paper exits FIRST before looking for new signals.
+            # This simulates SL/target being hit intraday in paper mode.
+            if PAPER_TRADE_MODE:
+                exit_result = self.order_manager.check_paper_exits(symbol, candle_dict)
+                if exit_result:
+                    logger.info(
+                        f"Paper intraday exit | {symbol} | "
+                        f"{exit_result['exit_reason']} | PnL:₹{exit_result['net_pnl']:+,.0f}"
+                    )
+                    # After exit, can potentially take another trade (if cap allows)
+
+            # Set ORB after 9:30 candle closes
             candle_t = (candle.timestamp.time()
                         if hasattr(candle.timestamp, 'time')
                         else datetime.now().time())
@@ -316,7 +372,7 @@ class AIHybridTradingSystem:
             if candle_t >= t(9, 30) and symbol not in self._orb_set:
                 self._try_set_orb(symbol, history)
 
-            # ── Risk gate check ───────────────────────────────────────
+            # Risk gate
             allowed, reason_str = self.risk_manager.can_trade()
             if self.notifier.is_stop_requested():
                 allowed    = False
@@ -330,11 +386,8 @@ class AIHybridTradingSystem:
                 )
                 return
 
-            # ── BUG 1 FIX: Get signal from AIHybridStrategy ───────────
-            candle_dict = candle.to_dict()
-            cum_vol     = float(history['volume'].sum()) if 'volume' in history.columns else 0.0
-
-            signal = self.ai_hybrid.get_signal(
+            cum_vol  = float(history['volume'].sum()) if 'volume' in history.columns else 0.0
+            signal   = self.ai_hybrid.get_signal(
                 symbol=symbol,
                 candle=candle_dict,
                 candle_history=history,
@@ -345,6 +398,7 @@ class AIHybridTradingSystem:
             )
 
             if signal:
+                # Store strategy name in order_info for exit callback
                 logger.info(f"Signal received: {signal}")
                 self.notifier.notify_signal(signal, dry_run=PAPER_TRADE_MODE)
                 self.daily_journal.log_trade_placed(signal, dry_run=PAPER_TRADE_MODE)
@@ -354,37 +408,23 @@ class AIHybridTradingSystem:
             logger.error(f"on_candle_close error for {symbol}: {e}")
 
     # ------------------------------------------------------------------
-    # BUG 4 FIX: Extract opening candles and call set_orb()
+    # ORB SETUP
     # ------------------------------------------------------------------
     def _try_set_orb(self, symbol: str, history: pd.DataFrame):
-        """
-        Extract 9:15, 9:20, 9:25 candles from history and set the ORB.
-        Called once per symbol when the 9:30 candle closes.
-        """
         try:
             opening_candles = []
             for ts, row in history.iterrows():
                 row_time = ts.time() if hasattr(ts, 'time') else None
                 if row_time and t(9, 15) <= row_time < t(9, 30):
                     opening_candles.append({
-                        'high':  float(row['high']),
-                        'low':   float(row['low']),
-                        'open':  float(row['open']),
-                        'close': float(row['close']),
+                        'high': float(row['high']), 'low': float(row['low']),
+                        'open': float(row['open']), 'close': float(row['close']),
                     })
 
             if opening_candles:
                 self.ai_hybrid.set_orb(symbol, opening_candles)
                 self._orb_set.add(symbol)
-                logger.info(
-                    f"ORB set for {symbol} using {len(opening_candles)} "
-                    f"opening candles ✓"
-                )
-            else:
-                logger.debug(
-                    f"No 9:15–9:25 candles in history yet for {symbol} "
-                    f"(history has {len(history)} rows)"
-                )
+                logger.info(f"ORB set for {symbol} using {len(opening_candles)} candles ✓")
 
         except Exception as e:
             logger.debug(f"_try_set_orb failed for {symbol}: {e}")
@@ -409,13 +449,17 @@ class AIHybridTradingSystem:
             logger.warning(f"Position size check failed: {size_msg}")
             return
 
+        clean_symbol = symbol.replace("NSE:", "")
         order_info = self.order_manager.place_order(
-            symbol=symbol.replace("NSE:", ""),
+            symbol=clean_symbol,
             direction=direction,
             entry=entry, sl=sl, target=target, quantity=qty
         )
 
         if order_info:
+            # BUG 13 FIX: Store strategy so exit callback has access to it
+            order_info['strategy'] = signal.strategy
+
             self.risk_manager.record_trade_entry()
             self.journal.log_entry(
                 symbol=symbol, direction=direction,
@@ -448,8 +492,7 @@ class AIHybridTradingSystem:
                 "📡 <b>Market Open — Live Tick Feed Connected</b>\n"
                 f"Watching: {', '.join(s.replace('NSE:','') for s in self.watchlist[:5])}\n"
                 f"Regime: {self._current_regime.trend if self._current_regime else 'UNKNOWN'} | "
-                f"VIX: {self._india_vix:.1f}\n"
-                f"Time: {datetime.now().strftime('%H:%M IST')}"
+                f"VIX: {self._india_vix:.1f}"
             )
 
         except Exception as e:
@@ -491,48 +534,33 @@ class AIHybridTradingSystem:
     # ------------------------------------------------------------------
     def _schedule_jobs(self):
         self.scheduler = BackgroundScheduler(timezone=IST)
-        self.scheduler.add_job(
-            self._daily_reset, 'cron', hour=9, minute=0, id='daily_reset'
-        )
-        self.scheduler.add_job(
-            self._eod_close, 'cron', hour=15, minute=15, id='eod_close'
-        )
-        self.scheduler.add_job(
-            self._end_of_day, 'cron', hour=15, minute=30, id='end_of_day'
-        )
+        self.scheduler.add_job(self._daily_reset,  'cron', hour=9,  minute=0,  id='daily_reset')
+        self.scheduler.add_job(self._eod_close,    'cron', hour=15, minute=15, id='eod_close')
+        self.scheduler.add_job(self._end_of_day,   'cron', hour=15, minute=30, id='end_of_day')
         self.scheduler.start()
         logger.info("Scheduler started")
 
     def _daily_reset(self):
-        """
-        BUG 5 FIX: Clear self.watchlist so pre_market_setup() runs every day.
-        Also resets all per-day cached state.
-        """
         logger.info("Scheduler: daily reset triggered")
 
-        # BUG 5 FIX: Must clear watchlist — otherwise pre_market_setup() never
-        # runs on day 2+ because run() checks `if not self.watchlist`.
         self.watchlist = []
         self._orb_set.clear()
-        self._nifty_daily  = None
-        self._india_vix    = 15.0
+        self._nifty_daily    = None
+        self._india_vix      = 15.0
         self._current_regime = None
+        self._avg_volumes.clear()  # BUG 11 FIX: clear cached volumes
 
-        # BUG 10 FIX: Get a fresh DailyJournal for the new day
         self.daily_journal = reset_journal()
 
-        # Reset all sub-system daily state
         self.candle_builder.reset_daily()
         self.risk_manager.reset_daily()
 
-        # BUG 1 FIX: reset ai_hybrid per-day state (clears ORB, trade_taken, etc.)
-        # setup_day() will be called properly in pre_market_setup() with real data
-        # For now just reset strategy internal state without regime data
-        self.ai_hybrid.orb.reset_daily()
-        self.ai_hybrid.vwap.reset_daily()
-        self.ai_hybrid.breakout.reset_daily()
+        # BUG 15 FIX: Use ai_hybrid.reset_daily() instead of individual calls.
+        # Old code: ai_hybrid.orb.reset_daily(), ai_hybrid.vwap.reset_daily()...
+        # This missed clearing _regime_blocked_logged_today on AIHybridStrategy.
+        self.ai_hybrid.reset_daily()
 
-        logger.info("Daily reset complete — watchlist cleared, awaiting pre_market_setup")
+        logger.info("Daily reset complete")
 
     def _eod_close(self):
         logger.info("Scheduler: EOD force close triggered")
@@ -541,17 +569,17 @@ class AIHybridTradingSystem:
         self.order_manager.force_close_all(reason="EOD_15:15")
 
     def _end_of_day(self):
-        """
-        BUG 6+7+10 FIX:
-        - Generate DailyJournal markdown report
-        - Read real wins/losses from exit log
-        - Pass journal_path to notify_eod_summary so file is attached
-        """
         logger.info("Scheduler: end-of-day wrap-up")
         state = self.risk_manager.get_state_snapshot()
         self.journal.log_daily_summary(state)
 
-        # BUG 7+10 FIX: Generate the daily journal markdown and get its path
+        # BUG 14 FIX: Include regime in EOD status for notify_eod_summary
+        if self._current_regime:
+            state['regime'] = (
+                f"{self._current_regime.trend}+{self._current_regime.volatility} "
+                f"(VIX {self._current_regime.india_vix:.1f})"
+            )
+
         try:
             journal_path = self.daily_journal.generate_report(
                 daily_pnl=state.get('daily_pnl', 0),
@@ -561,10 +589,9 @@ class AIHybridTradingSystem:
             logger.error(f"Journal generate_report failed: {e}")
             journal_path = None
 
-        # BUG 6 FIX: Build wins/losses from exit log, not risk manager snapshot
-        exit_log    = getattr(self.daily_journal, 'exit_log', [])
-        wins        = sum(1 for e in exit_log if e.get('pnl', 0) > 0)
-        losses      = sum(1 for e in exit_log if e.get('pnl', 0) <= 0)
+        exit_log = getattr(self.daily_journal, 'exit_log', [])
+        wins     = sum(1 for e in exit_log if e.get('pnl', 0) > 0)
+        losses   = sum(1 for e in exit_log if e.get('pnl', 0) <= 0)
         state['wins']   = wins
         state['losses'] = losses
 
@@ -575,7 +602,7 @@ class AIHybridTradingSystem:
         )
 
     # ------------------------------------------------------------------
-    # FIX 14a RETAINED: MAIN RUN LOOP
+    # MAIN RUN LOOP
     # ------------------------------------------------------------------
     def run(self):
         logger.info("Starting main loop...")
@@ -590,8 +617,6 @@ class AIHybridTradingSystem:
                 now = datetime.now(IST).time()
 
                 if t(9, 0) <= now < t(15, 20):
-                    # BUG 5 FIX: watchlist is cleared in _daily_reset() every morning
-                    # so this correctly re-runs pre_market_setup() each day
                     if not self.watchlist:
                         self.pre_market_setup()
 
@@ -629,16 +654,6 @@ class AIHybridTradingSystem:
             self.scheduler.shutdown(wait=False)
 
         self.notifier.send("⚡ <b>System shut down.</b> All positions force-closed.")
-        logger.info("Shutdown complete")
-
-    def _get_avg_volume(self, symbol: str) -> float:
-        """
-        TODO: Cache real 20-day average volumes per symbol during pre_market_setup.
-        Currently returns a safe default. This affects ORB and Breakout ATR
-        volume filters — they'll use proportional thresholds but won't be
-        stock-specific until this is wired to real data.
-        """
-        return 1_000_000.0
 
 
 # ================================================================
@@ -647,15 +662,10 @@ class AIHybridTradingSystem:
 def run_scan_only():
     logger.info("=== SCAN-ONLY MODE ===")
     notifier = get_notifier()
-
     try:
         kite_login = KiteLogin()
         kite       = kite_login.get_kite_instance()
-        notifier.send(
-            "🔍 <b>Scan-Only Mode</b>\n"
-            "✅ Zerodha login successful.\n"
-            "Running pre-market scanner..."
-        )
+        notifier.send("🔍 <b>Scan-Only Mode</b>\n✅ Login OK. Running scanner...")
     except Exception as e:
         notifier.notify_login_failed(str(e))
         raise
@@ -710,8 +720,7 @@ if __name__ == "__main__":
                           f"PF: {m.get('profit_factor', 0):.2f} | "
                           f"Net PnL: ₹{m.get('total_net_pnl', 0):+,.0f}")
             print()
-            print("  For real data backtest: python backtest/fetch_and_backtest.py")
-            print()
+            print("  For real data: python backtest/fetch_and_backtest.py")
         except ImportError as e:
             logger.error(f"Backtest engine not available: {e}")
             sys.exit(1)
