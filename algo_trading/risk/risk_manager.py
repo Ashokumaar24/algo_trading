@@ -3,22 +3,13 @@
 #  Real-time risk management — enforces daily limits
 #
 #  FIX 10 (Critical): can_trade() returns (bool, str) tuple
-#    - Original returned bool only; caller had to call can_trade()
-#      THEN get_block_reason() separately
-#    - This created a race condition at time boundaries:
-#      between the two calls, the clock could tick past a cutoff,
-#      making the block reason inconsistent with the bool
-#    - Fix: single datetime.now() snapshot, returns both in one call
-#    - get_block_reason() is kept as a wrapper for backward compat
-#
 #  FIX 15 (Critical): Thread safety on RiskState mutations
-#    - record_trade_entry() and record_trade_exit() are called from:
-#        * KiteTicker thread (on_order_update)
-#        * APScheduler thread (EOD reset)
-#    - Without a lock, concurrent increments/reads are a data race
-#    - Fix: threading.Lock() wraps all state mutations
-#    - get_block_reason() is read-only so it does NOT hold the lock
-#      (avoids deadlock if called from the same thread)
+#  FIX (startup): Added get_status() method.
+#    - telegram_notifier.py calls risk_manager.get_status()
+#    - Only get_state_snapshot() existed → AttributeError on every
+#      /status Telegram command and on EOD summary.
+#    - get_status() is now a public alias for get_state_snapshot()
+#      so both call sites work without any further changes.
 # ============================================================
 
 import threading
@@ -34,8 +25,9 @@ from utils.logger import get_logger
 
 logger = get_logger("risk_manager")
 
+
 # ----------------------------------------------------------------
-# RISK STATE (plain dataclass — mutations protected by RiskManager._lock)
+# RISK STATE
 # ----------------------------------------------------------------
 @dataclass
 class RiskState:
@@ -48,7 +40,7 @@ class RiskState:
 
     def reset_daily(self):
         self.trades_today       = 0
-        self.open_positions     = max(0, self.open_positions)  # don't clear live positions
+        self.open_positions     = max(0, self.open_positions)
         self.daily_pnl          = 0.0
         self.consecutive_losses = 0
         self.trade_date         = datetime.now().date()
@@ -68,14 +60,13 @@ class RiskManager:
 
     FIX 10: can_trade() returns Tuple[bool, str] from a single time snapshot.
     FIX 15: All state mutations are wrapped in threading.Lock().
+    FIX:    get_status() added as public alias for get_state_snapshot().
     """
 
     def __init__(self, capital: float = INITIAL_CAPITAL):
         self.capital = capital
         self.state   = RiskState()
-
-        # FIX 15: One lock for all state mutations
-        self._lock = threading.Lock()
+        self._lock   = threading.Lock()
 
         logger.info(
             f"RiskManager init | Capital:₹{capital:,.0f} | "
@@ -89,24 +80,11 @@ class RiskManager:
     def can_trade(self, current_time: Optional[dt_time] = None) -> Tuple[bool, str]:
         """
         Check all risk gates in a single call.
-
-        FIX 10: Uses ONE datetime.now() snapshot and returns both the
-        decision AND the reason together — no race condition between
-        the two separate calls of the original design.
-
-        Returns:
-            (True, "OK")                     — trading is allowed
-            (False, "TIME_GATE: ...")         — after cutoff time
-            (False, "TRADE_CAP: ...")         — daily trade limit reached
-            (False, "RISK_GATE: daily loss")  — loss limit hit
-            (False, "RISK_GATE: consec loss") — 5 consecutive losses
+        Returns (True, "OK") or (False, "REASON: ...").
         """
-        # One clock snapshot — prevents race at time boundaries
         now = current_time or datetime.now().time()
-
         no_entry_cutoff = NO_NEW_ENTRIES
 
-        # 1. Time gate
         if now >= no_entry_cutoff:
             return (
                 False,
@@ -114,7 +92,6 @@ class RiskManager:
                 f"{no_entry_cutoff.strftime('%H:%M')}"
             )
 
-        # 2. Daily trade cap
         if self.state.trades_today >= MAX_TRADES_PER_DAY:
             return (
                 False,
@@ -122,7 +99,6 @@ class RiskManager:
                 f"trades taken today"
             )
 
-        # 3. Daily loss limit
         daily_loss_limit = -abs(self.capital * DAILY_LOSS_LIMIT_PCT)
         if self.state.daily_pnl <= daily_loss_limit:
             return (
@@ -131,7 +107,6 @@ class RiskManager:
                 f">= limit ₹{abs(daily_loss_limit):,.0f}"
             )
 
-        # 4. Consecutive losses circuit breaker
         if self.state.consecutive_losses >= 5:
             return (
                 False,
@@ -142,14 +117,10 @@ class RiskManager:
         return True, "OK"
 
     # ------------------------------------------------------------------
-    # BACKWARD-COMPATIBLE WRAPPER (get_block_reason)
+    # BACKWARD-COMPATIBLE WRAPPER
     # ------------------------------------------------------------------
     def get_block_reason(self, current_time: Optional[dt_time] = None) -> dict:
-        """
-        Returns block details as a dict.
-        Wraps can_trade() — kept for backward compatibility.
-        Callers should prefer can_trade() for the atomic bool+reason.
-        """
+        """Returns block details as a dict. Wraps can_trade()."""
         _, reason_str = self.can_trade(current_time)
         block_type    = reason_str.split(":")[0] if ":" in reason_str else "UNKNOWN"
         return {
@@ -162,12 +133,8 @@ class RiskManager:
     # FIX 15: THREAD-SAFE STATE MUTATIONS
     # ------------------------------------------------------------------
     def record_trade_entry(self):
-        """
-        Call when an entry order is accepted.
-        FIX 15: Lock protects concurrent increment from ticker + scheduler.
-        """
         with self._lock:
-            self.state.trades_today  += 1
+            self.state.trades_today   += 1
             self.state.open_positions += 1
 
         logger.info(
@@ -177,10 +144,6 @@ class RiskManager:
         )
 
     def record_trade_exit(self, pnl: float):
-        """
-        Call when a position is closed (SL hit, target hit, or force close).
-        FIX 15: Lock protects concurrent update from ticker + scheduler.
-        """
         with self._lock:
             self.state.daily_pnl          += pnl
             self.state.weekly_pnl         += pnl
@@ -198,20 +161,15 @@ class RiskManager:
         )
 
     def reset_daily(self):
-        """
-        Call at start of each trading day (9:00 AM scheduler job).
-        FIX 15: Lock protects reset from concurrent trade callbacks.
-        """
         with self._lock:
             self.state.reset_daily()
-
         logger.info("RiskManager: daily state reset complete")
 
     # ------------------------------------------------------------------
-    # READ-ONLY HELPERS (no lock needed)
+    # READ-ONLY HELPERS
     # ------------------------------------------------------------------
     def get_state_snapshot(self) -> dict:
-        """Return a copy of current risk state for logging/dashboard"""
+        """Return a copy of current risk state for logging/dashboard."""
         return {
             'trades_today':       self.state.trades_today,
             'open_positions':     self.state.open_positions,
@@ -222,12 +180,21 @@ class RiskManager:
             'block_reason':       self.can_trade()[1],
         }
 
+    def get_status(self) -> dict:
+        """
+        FIX: Public alias for get_state_snapshot().
+
+        telegram_notifier.py calls self._trading_system.risk_manager.get_status()
+        but only get_state_snapshot() existed, causing AttributeError on every
+        /status Telegram command and on EOD summary generation.
+
+        Both methods return the same dict — callers can use either name.
+        """
+        return self.get_state_snapshot()
+
     def is_position_size_ok(self, entry: float, sl: float,
                              quantity: int) -> Tuple[bool, str]:
-        """
-        Check that a proposed trade doesn't exceed per-trade risk limits.
-        Max risk per trade = 1% of capital.
-        """
+        """Check that a proposed trade doesn't exceed per-trade risk limits."""
         risk_per_share = abs(entry - sl)
         total_risk     = risk_per_share * quantity
         max_risk       = self.capital * 0.01  # 1%
@@ -241,14 +208,10 @@ class RiskManager:
         return True, "OK"
 
     def calculate_position_size(self, entry: float, sl: float) -> int:
-        """
-        Calculate shares to trade based on 0.5% risk per trade.
-        Returns 0 if the SL is at entry (invalid setup).
-        """
+        """Calculate shares to trade based on 0.5% risk per trade."""
         risk_per_share = abs(entry - sl)
         if risk_per_share <= 0:
             return 0
-
-        risk_amount = self.capital * 0.005  # 0.5% risk per trade
+        risk_amount = self.capital * 0.005
         qty         = int(risk_amount / risk_per_share)
         return max(qty, 1)

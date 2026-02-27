@@ -3,18 +3,21 @@
 #  AI Hybrid Algo Trading Bot — Main Entry Point
 #
 #  FIX 14a: Deduplicated pre_market_setup() calls
-#    - Original: pre_market_setup() called in BOTH the 9:00-9:20 branch
-#      AND the 9:20-15:20 branch — called twice on startup between 9:20-9:30
-#    - Fix: single condition covers the full window (9:00 to 15:20)
-#      so it's only ever called once per session
-#
 #  FIX 14b: on_candle_close unpacks can_trade() tuple
-#    - Original: called can_trade() as bool, then get_block_reason() separately
-#      — race condition at time boundaries (FIX 10 in risk_manager.py)
-#    - Fix: allowed, reason_str = self.risk_manager.can_trade()
-#      Both values come from one atomic call
 #
-#  All other fixes are in the individual modules.
+#  FIX (startup crash): KiteLogin import now works.
+#    - auth/login.py lacked the KiteLogin class → ImportError on startup.
+#    - KiteLogin class added to auth/login.py (see that file for details).
+#
+#  FIX (CLI flags): --backtest and --scan-only now work.
+#    - README documented `python main.py --backtest` and
+#      `python main.py --scan-only`, but neither flag was parsed or
+#      acted on — the __main__ block always called system.run() regardless.
+#    - Both flags are now handled in __main__ before constructing the
+#      full AIHybridTradingSystem (which requires Zerodha login).
+#    - --backtest runs the demo backtest via BacktestEngine directly.
+#    - --scan-only logs in, runs the pre-market scanner, prints results,
+#      and exits — no ticker, no orders.
 # ============================================================
 
 import sys
@@ -27,18 +30,29 @@ from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# ── Parse --dry-run flag ──────────────────────────────────────────
-_parser = argparse.ArgumentParser(add_help=False)
-_parser.add_argument('--dry-run', action='store_true', default=False)
-_args, _ = _parser.parse_known_args()
-DRY_RUN = _args.dry_run
+# ── Parse CLI flags ───────────────────────────────────────────────
+_parser = argparse.ArgumentParser(
+    description="AI Hybrid Algo Trading System",
+    add_help=True,
+)
+_parser.add_argument('--dry-run',   action='store_true', default=False,
+                     help="Paper trade mode — no real orders or Zerodha login")
+_parser.add_argument('--backtest',  action='store_true', default=False,
+                     help="Run demo backtest on synthetic data and exit")
+_parser.add_argument('--scan-only', action='store_true', default=False,
+                     help="Run pre-market scanner only, print results, and exit")
+_args = _parser.parse_args()
+
+DRY_RUN   = _args.dry_run
+BACKTEST  = _args.backtest
+SCAN_ONLY = _args.scan_only
 
 if DRY_RUN:
     print("[DRY-RUN] Starting in paper/simulation mode — no real orders or login")
 
 from kiteconnect import KiteTicker
 from apscheduler.schedulers.background import BackgroundScheduler
-from zoneinfo import ZoneInfo   # built-in from Python 3.9 — no install needed
+from zoneinfo import ZoneInfo
 
 from auth.login import KiteLogin
 from scanner.pre_market_scanner import PreMarketScanner
@@ -54,9 +68,9 @@ from config.config import (
     MAX_TRADES_PER_DAY, CAPITAL, NIFTY50_SYMBOLS
 )
 
-# PAPER_TRADE_MODE: True in --dry-run, False in live
 PAPER_TRADE_MODE = DRY_RUN
-INITIAL_CAPITAL  = CAPITAL   # alias for readability
+INITIAL_CAPITAL  = CAPITAL
+
 from utils.logger import get_logger
 
 logger = get_logger("main")
@@ -77,22 +91,18 @@ class AIHybridTradingSystem:
         logger.info("  AI HYBRID TRADING SYSTEM — Starting up")
         logger.info("=" * 60)
 
-        # Auth & connection
-        # In --dry-run mode skip real Zerodha login entirely
         if DRY_RUN:
             self.kite = self._create_mock_kite()
         else:
             kite_login = KiteLogin()
             self.kite  = kite_login.get_kite_instance()
 
-        # Core subsystems
         self.scanner        = PreMarketScanner(self.kite)
         self.candle_builder = CandleBuilder(interval_minutes=5)
         self.order_manager  = OrderManager(self.kite, paper_trade=PAPER_TRADE_MODE)
         self.risk_manager   = RiskManager(capital=INITIAL_CAPITAL)
         self.journal        = TradeJournal()
 
-        # Strategies
         self.strategies = {
             'ORB_15':        ORBStrategy(),
             'VWAP_PULLBACK': VWAPPullbackStrategy(),
@@ -100,11 +110,10 @@ class AIHybridTradingSystem:
             'BREAKOUT_ATR':  BreakoutATRStrategy(),
         }
 
-        # Active watchlist (set by scanner at 9:05 AM)
-        self.watchlist      = []
-        self.ticker         = None
-        self.scheduler      = None
-        self._running       = False
+        self.watchlist  = []
+        self.ticker     = None
+        self.scheduler  = None
+        self._running   = False
 
     # ------------------------------------------------------------------
     # PRE-MARKET SETUP (9:05 AM)
@@ -141,8 +150,6 @@ class AIHybridTradingSystem:
         FIX 14b: Unpack can_trade() tuple in one call — no race condition.
         """
         try:
-            # FIX 14b: Single atomic call — avoid race between can_trade()
-            # and get_block_reason() that existed in the original code
             allowed, reason_str = self.risk_manager.can_trade()
 
             if not allowed:
@@ -289,19 +296,14 @@ class AIHybridTradingSystem:
     def _schedule_jobs(self):
         self.scheduler = BackgroundScheduler(timezone=IST)
 
-        # Daily reset (9:00 AM)
         self.scheduler.add_job(
             self._daily_reset, 'cron',
             hour=9, minute=0, id='daily_reset'
         )
-
-        # Force close all positions (15:15 PM)
         self.scheduler.add_job(
             self._eod_close, 'cron',
             hour=15, minute=15, id='eod_close'
         )
-
-        # Strategy reset for next day (15:30 PM)
         self.scheduler.add_job(
             self._end_of_day, 'cron',
             hour=15, minute=30, id='end_of_day'
@@ -334,11 +336,7 @@ class AIHybridTradingSystem:
     def run(self):
         """
         Main run loop. Checks market time and calls appropriate actions.
-
-        FIX 14a: Original called pre_market_setup() in BOTH the
-        9:00-9:20 AND 9:20-15:20 branches, triggering it twice during
-        the 9:20-9:30 window. Now: single condition covers the full
-        pre-market-to-market window.
+        FIX 14a: pre_market_setup() called only once (when watchlist is empty).
         """
         logger.info("Starting main loop...")
         self._schedule_jobs()
@@ -351,19 +349,14 @@ class AIHybridTradingSystem:
             try:
                 now = datetime.now(IST).time()
 
-                # 9:00 AM – 15:20 PM: active trading session
-                # FIX 14a: Single condition — no duplicate call
                 if t(9, 0) <= now < t(15, 20):
-
                     if not self.watchlist:
-                        # Only run setup if watchlist is empty (first time)
                         self.pre_market_setup()
 
                     if now >= t(9, 15) and self.ticker is None:
                         self.start_ticker()
 
                 elif now >= t(15, 20):
-                    # Post-market: ensure cleanup ran
                     if self._running and self.ticker:
                         logger.info("Post-market: stopping ticker")
                         try:
@@ -395,15 +388,10 @@ class AIHybridTradingSystem:
         logger.info("Shutdown complete")
 
     def _get_avg_volume(self, symbol: str) -> float:
-        """Placeholder — replace with real 20-day average daily volume lookup"""
         return 1_000_000.0
 
     def _create_mock_kite(self):
-        """
-        Returns a lightweight mock KiteConnect for --dry-run mode.
-        All API calls return safe empty responses so the system can
-        start and process candles without touching Zerodha.
-        """
+        """Returns a lightweight mock KiteConnect for --dry-run mode."""
         class MockKite:
             api_key      = "dry_run"
             access_token = "dry_run"
@@ -424,8 +412,81 @@ class AIHybridTradingSystem:
 
 
 # ================================================================
+#  SCAN-ONLY MODE — login, run scanner, print results, exit
+# ================================================================
+def run_scan_only():
+    """
+    FIX: --scan-only now actually runs.
+    Login → pre-market scan → print top 5 → exit.
+    No ticker, no orders, no scheduler.
+    """
+    logger.info("=== SCAN-ONLY MODE ===")
+    kite_login = KiteLogin()
+    kite       = kite_login.get_kite_instance()
+
+    scanner    = PreMarketScanner(kite)
+    candidates = scanner.run(top_n=5)
+    scanner.print_report(candidates)
+    logger.info("Scan complete. Exiting.")
+
+
+# ================================================================
 #  ENTRY POINT
 # ================================================================
 if __name__ == "__main__":
+
+    # ── --backtest: run demo backtest and exit ────────────────────
+    if BACKTEST:
+        logger.info("=== BACKTEST MODE ===")
+        try:
+            from backtest.backtest_engine import BacktestEngine, run_all_strategy_comparison
+            import pandas as pd
+            import numpy as np
+
+            # Generate synthetic 5-min data for the demo
+            logger.info("Generating synthetic demo data...")
+            dates = pd.date_range("2025-01-01 09:15", periods=2000, freq="5min")
+            dates = dates[dates.time() >= __import__('datetime').time(9, 15)]
+            dates = dates[dates.time() <= __import__('datetime').time(15, 15)]
+
+            np.random.seed(42)
+            close  = 500 + np.cumsum(np.random.randn(len(dates)) * 2)
+            open_  = close + np.random.randn(len(dates))
+            high   = np.maximum(open_, close) + abs(np.random.randn(len(dates)))
+            low    = np.minimum(open_, close) - abs(np.random.randn(len(dates)))
+            volume = np.random.randint(100_000, 500_000, len(dates)).astype(float)
+
+            demo_df = pd.DataFrame({
+                'open': open_, 'high': high, 'low': low,
+                'close': close, 'volume': volume
+            }, index=dates)
+
+            demo_data = {"NSE:RELIANCE": demo_df}
+            metrics   = run_all_strategy_comparison(demo_data)
+
+            print("\n" + "=" * 60)
+            print("  BACKTEST RESULTS (demo / synthetic data)")
+            print("=" * 60)
+            for m in metrics:
+                if "error" not in m:
+                    print(f"  {m['strategy']:<20} | "
+                          f"Win Rate: {m.get('win_rate_pct', 0):.1f}% | "
+                          f"Sharpe: {m.get('sharpe_ratio', 0):.2f} | "
+                          f"PF: {m.get('profit_factor', 0):.2f} | "
+                          f"Net PnL: ₹{m.get('total_net_pnl', 0):+,.0f}")
+            print()
+            print("  For real data backtest: python backtest/fetch_and_backtest.py")
+            print()
+        except ImportError as e:
+            logger.error(f"Backtest engine not available: {e}")
+            sys.exit(1)
+        sys.exit(0)
+
+    # ── --scan-only: login, scan, print, exit ────────────────────
+    if SCAN_ONLY:
+        run_scan_only()
+        sys.exit(0)
+
+    # ── Normal / dry-run: full trading system ────────────────────
     system = AIHybridTradingSystem()
     system.run()

@@ -5,6 +5,12 @@
 #  Critical: must use kite.zerodha.com/connect/login?api_key=...
 #  NOT kite.zerodha.com — the /connect/login URL is what
 #  generates the request_token after TOTP.
+#
+#  FIX (startup crash): Added KiteLogin class.
+#    - main.py does `from auth.login import KiteLogin` and calls
+#      kite_login.get_kite_instance().
+#    - No such class existed → ImportError on every startup.
+#    - KiteLogin is now a thin class wrapper around get_kite_session().
 # ============================================================
 
 import os
@@ -180,8 +186,6 @@ def login(headless: bool = True) -> str:
     totp_ok    = bool(totp_key and totp_key not in ('', 'YOUR_TOTP_BASE32_KEY'))
 
     # ── Get Telegram offset BEFORE sending OTP request ───────────────
-    # This ensures we only read messages sent AFTER our prompt —
-    # ignoring any old messages already in the inbox.
     tg_offset = 0
     if tg_enabled:
         tg_offset = _get_latest_update_id(tg_token)
@@ -224,8 +228,6 @@ def login(headless: bool = True) -> str:
 
     try:
         # ── Step 1: Open KiteConnect API login URL ────────────────────
-        # THIS IS THE KEY FIX:
-        # Must use /connect/login?api_key=... to get request_token in redirect
         login_url = f"https://kite.zerodha.com/connect/login?api_key={api_key}&v=3"
         logger.info(f"Opening KiteConnect login URL...")
         driver.get(login_url)
@@ -287,7 +289,6 @@ def login(headless: bool = True) -> str:
                     "Add Telegram credentials to lines 6 and 7."
                 )
 
-            # Snapshot offset again before sending the prompt
             tg_offset = _get_latest_update_id(tg_token)
 
             _send_telegram(tg_token, tg_chat_id,
@@ -359,7 +360,7 @@ def login(headless: bool = True) -> str:
 
 
 # ----------------------------------------------------------------
-# PUBLIC API
+# PUBLIC API — function-based (original)
 # ----------------------------------------------------------------
 def get_kite_session(headless: bool = True):
     """Login and return an authenticated KiteConnect instance."""
@@ -373,6 +374,43 @@ def get_kite_session(headless: bool = True):
 
 def load_credentials() -> dict:
     return _load_credentials()
+
+
+# ----------------------------------------------------------------
+# FIX: KiteLogin class — was missing, causing ImportError in main.py
+#
+# main.py does:
+#   from auth.login import KiteLogin
+#   kite_login = KiteLogin()
+#   self.kite = kite_login.get_kite_instance()
+#
+# Previously this raised ImportError immediately on startup.
+# KiteLogin is now a thin class wrapper around get_kite_session().
+# ----------------------------------------------------------------
+class KiteLogin:
+    """
+    Class-based login wrapper for use by main.py.
+
+    Usage:
+        kite_login = KiteLogin()
+        kite = kite_login.get_kite_instance()   # returns KiteConnect
+    """
+
+    def __init__(self, headless: bool = True):
+        self.headless = headless
+        self._kite = None
+
+    def get_kite_instance(self):
+        """
+        Perform login and return an authenticated KiteConnect instance.
+        Caches the result so get_kite_instance() is idempotent within
+        the same session.
+        """
+        if self._kite is None:
+            logger.info("KiteLogin: initiating Zerodha authentication...")
+            self._kite = get_kite_session(headless=self.headless)
+            logger.info("KiteLogin: authentication complete ✓")
+        return self._kite
 
 
 # ----------------------------------------------------------------

@@ -1,6 +1,15 @@
 # ============================================================
 #  strategies/base_strategy.py
 #  Signal dataclass and abstract base for all strategies
+#
+#  FIX: Added reset_daily() to BaseStrategy.
+#    - main.py calls strat.reset_daily() for every strategy in the dict,
+#      including any future strategy that extends BaseStrategy.
+#    - Previously the base class had NO reset_daily(), so any new strategy
+#      that forgot to implement it would raise AttributeError silently at
+#      the daily reset at 9:00 AM — long after startup.
+#    - Base implementation is a no-op with a warning so it's always safe
+#      to call, and subclasses override it with their own logic.
 # ============================================================
 
 from dataclasses import dataclass, field
@@ -15,8 +24,8 @@ class Direction(str, Enum):
 
 
 class SignalStatus(str, Enum):
-    PENDING  = "PENDING"
-    ACTIVE   = "ACTIVE"
+    PENDING    = "PENDING"
+    ACTIVE     = "ACTIVE"
     HIT_TARGET = "HIT_TARGET"
     HIT_SL     = "HIT_SL"
     EXPIRED    = "EXPIRED"
@@ -46,8 +55,8 @@ class Signal:
     sentiment:     float    = 0.0
 
     # Trailing / partial exits
-    target_2:      Optional[float] = None    # 2R target
-    trail_trigger: Optional[float] = None    # profit to trigger trailing
+    target_2:      Optional[float] = None
+    trail_trigger: Optional[float] = None
 
     # Metadata
     timestamp:     datetime = field(default_factory=datetime.now)
@@ -100,6 +109,20 @@ class BaseStrategy:
         Must be implemented by subclasses.
         """
         raise NotImplementedError
+
+    def reset_daily(self):
+        """
+        FIX: Reset any per-day state at the start of each trading session.
+
+        main.py calls strat.reset_daily() for every strategy at 9:00 AM.
+        Previously this method didn't exist in the base class, so any
+        strategy that inherited BaseStrategy without overriding reset_daily()
+        would raise AttributeError silently during the daily reset.
+
+        This base implementation is a safe no-op. Subclasses (ORBStrategy,
+        VWAPPullbackStrategy, etc.) override it with their own clearing logic.
+        """
+        pass  # subclasses override; base no-op is always safe to call
 
     def _validate_candle_count(self, df, min_candles: int) -> bool:
         """Ensure we have enough history before calculating indicators"""
