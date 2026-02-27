@@ -1,21 +1,36 @@
 # ============================================================
 #  utils/candle_builder.py
 #  Builds 5-minute OHLCV candles from real-time KiteTicker ticks
-#  Fires on_candle_close callback on every completed candle
 #
-#  FIX: _get_candle_start formula was completely broken.
-#       Original used `self.interval.seconds * 60` which caused
-#       every tick to map to the 9:15 candle all morning.
-#       Corrected to use `self.interval.seconds // 60` (interval in minutes).
+#  FIX 4 (Critical): Complete daily reset
+#    - reset_daily() now clears ALL per-symbol state:
+#      open_candles, candle_start, history, cumulative_volume
+#    - Previously only cleared cumulative_volume, leaving
+#      yesterday's partial candle and stale history in memory.
+#      This caused today's indicators to include yesterday's candles.
+#
+#  FIX 11 (Refactor): History stored as deque(maxlen=500)
+#    - Replaced manual list-trim (which created a new list object
+#      every 500 candles, wasting memory and CPU)
+#    - deque(maxlen=500) auto-trims from the left — O(1) vs O(n)
+#    - Also thread-safe for appends
+#
+#  EXISTING FIX (kept): _get_candle_start formula
+#    - Original used interval.seconds * 60 (wrong — mapped everything
+#      to the 9:15 candle all morning)
+#    - Fixed to use interval_minutes (int)
 # ============================================================
 
 import pandas as pd
 from datetime import datetime, timedelta
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Callable, Dict, Optional
 from utils.logger import get_logger
 
 logger = get_logger("candle_builder")
+
+# FIX 11: Maximum candles to keep in memory per symbol (≈2 trading days)
+HISTORY_MAXLEN = 500
 
 
 class Candle:
@@ -24,14 +39,14 @@ class Candle:
                  'volume', 'oi', 'is_complete']
 
     def __init__(self, symbol, timestamp, open_, high, low, close, volume, oi=0):
-        self.symbol    = symbol
-        self.timestamp = timestamp
-        self.open      = open_
-        self.high      = high
-        self.low       = low
-        self.close     = close
-        self.volume    = volume
-        self.oi        = oi
+        self.symbol      = symbol
+        self.timestamp   = timestamp
+        self.open        = open_
+        self.high        = high
+        self.low         = low
+        self.close       = close
+        self.volume      = volume
+        self.oi          = oi
         self.is_complete = False
 
     def to_dict(self):
@@ -66,13 +81,19 @@ class CandleBuilder:
     """
 
     def __init__(self, interval_minutes: int = 5):
-        self.interval_minutes = interval_minutes                  # FIX: store as int directly
+        self.interval_minutes = interval_minutes
         self.interval         = timedelta(minutes=interval_minutes)
+
+        # Per-symbol state — ALL of these are cleared in reset_daily()
         self.open_candles: Dict[str, Candle]     = {}
         self.candle_start: Dict[str, datetime]   = {}
-        self.history: Dict[str, list]            = defaultdict(list)
+        # FIX 11: Use deque(maxlen=500) instead of plain list
+        self.history: Dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=HISTORY_MAXLEN)
+        )
         self.cumulative_volume: Dict[str, float] = defaultdict(float)
-        self._callback: Optional[Callable]       = None
+
+        self._callback: Optional[Callable] = None
 
     def set_callback(self, callback: Callable):
         """Register the function to call when a candle closes"""
@@ -82,18 +103,14 @@ class CandleBuilder:
         """
         Snap tick time back to the start of its candle period.
 
-        FIX: Original formula was:
-             period_index = minutes_since_open // self.interval.seconds * 60
-             which equals  (minutes_since_open // 300) * 60
-             giving 0 for all ticks before 2:15 PM (300 minutes after open).
-
-        Correct formula:
-             period_index = minutes_since_open // interval_minutes
+        FIX (existing): Original formula used interval.seconds * 60 which
+        equals (minutes_since_open // 300) * 60 — returning 0 for all
+        ticks before 2:15 PM, mapping everything to the 9:15 candle.
+        Correct formula: minutes_since_open // interval_minutes
         """
         minutes_since_open = (tick_time.hour * 60 + tick_time.minute) - (9 * 60 + 15)
-        # FIX: use interval_minutes (int), not interval.seconds
-        period_index = minutes_since_open // self.interval_minutes
-        snap_minutes = 9 * 60 + 15 + period_index * self.interval_minutes
+        period_index  = minutes_since_open // self.interval_minutes
+        snap_minutes  = 9 * 60 + 15 + period_index * self.interval_minutes
         return tick_time.replace(
             hour=snap_minutes // 60,
             minute=snap_minutes % 60,
@@ -141,11 +158,11 @@ class CandleBuilder:
             prev_vol = self.cumulative_volume[symbol]
             tick_vol = volume - prev_vol if volume > prev_vol else 0
 
-            candle.high   = max(candle.high,  price)
-            candle.low    = min(candle.low,   price)
-            candle.close  = price
+            candle.high    = max(candle.high,  price)
+            candle.low     = min(candle.low,   price)
+            candle.close   = price
             candle.volume += tick_vol
-            candle.oi     = oi
+            candle.oi      = oi
 
             self.cumulative_volume[symbol] = volume
 
@@ -156,11 +173,8 @@ class CandleBuilder:
             return
 
         candle.is_complete = True
+        # FIX 11: deque auto-trims to maxlen — no manual slice needed
         self.history[symbol].append(candle)
-
-        # Keep only last 500 candles per symbol in memory
-        if len(self.history[symbol]) > 500:
-            self.history[symbol] = self.history[symbol][-500:]
 
         logger.debug(f"Candle closed: {candle}")
 
@@ -177,7 +191,8 @@ class CandleBuilder:
             return pd.DataFrame(
                 columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
             )
-        records = [c.to_dict() for c in self.history[symbol]]
+        # FIX 11: convert deque to list before iterating
+        records = [c.to_dict() for c in list(self.history[symbol])]
         df = pd.DataFrame(records)
         df.set_index('timestamp', inplace=True)
         return df
@@ -189,6 +204,19 @@ class CandleBuilder:
         logger.info("All open candles force-closed.")
 
     def reset_daily(self):
-        """Reset cumulative volumes at start of each day"""
+        """
+        FIX 4: Full reset at start of each trading day.
+
+        Clears ALL per-symbol state so yesterday's data cannot bleed
+        into today's candles or rolling indicator calculations.
+
+        Previously only cleared cumulative_volume, leaving:
+          - open_candles: yesterday's partial last candle
+          - candle_start: wrong timestamp for today's first candle
+          - history:      yesterday's candles polluting indicator lookback
+        """
+        self.open_candles.clear()
+        self.candle_start.clear()
+        self.history.clear()            # FIX 4: was missing
         self.cumulative_volume.clear()
-        logger.info("Candle builder daily reset complete.")
+        logger.info("CandleBuilder: full daily reset — all state cleared ✓")

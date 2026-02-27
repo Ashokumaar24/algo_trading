@@ -2,10 +2,15 @@
 #  strategies/vwap_pullback.py
 #  VWAP Pullback Strategy — Core strategy of the AI Hybrid
 #
-#  FIX: `prev_low` falsy check was `if prev_low else close`
-#       which evaluates to `close` when prev_low is 0 or any
-#       small number Python considers falsy.
-#       Changed to explicit `if prev_low is not None else close`.
+#  FIX 7 (Logic): Replaced no-op reward_risk >= 1.3 filter.
+#    - Target is always 2.0 × risk, so reward_risk is always 2.0.
+#    - The old check (2.0 >= 1.3) always passed — it filtered nothing.
+#    - Replaced with MIN_RISK_PCT = 0.002 (0.2% of entry price).
+#    - Setups with risk < 0.2% are now skipped (too tight for slippage).
+#
+#  FIX (existing): `prev_low` falsy check was `if prev_low else close`
+#    - Evaluates to `close` when prev_low is 0 or any falsy number.
+#    - Changed to explicit `if prev_low is not None else close`.
 # ============================================================
 
 import pandas as pd
@@ -13,7 +18,7 @@ from datetime import time, datetime
 from typing import Optional
 
 from strategies.base_strategy import BaseStrategy, Signal, Direction
-from utils.indicators import ema, vwap, atr, ema_slope
+from utils.indicators import ema, vwap, atr
 from config.config import (
     VWAP_EMA_PERIOD, VWAP_TOLERANCE_PCT, VWAP_ENTRY_DEADLINE,
     VWAP_TRAIL_AFTER_1R
@@ -21,6 +26,10 @@ from config.config import (
 from utils.logger import get_logger
 
 logger = get_logger("vwap_pullback")
+
+# FIX 7: Minimum risk threshold — skip setups where risk is < 0.2% of price.
+# This filters out overly tight stops that would be wiped by normal slippage.
+MIN_RISK_PCT = 0.002   # 0.2% of entry price
 
 
 class VWAPPullbackStrategy(BaseStrategy):
@@ -33,10 +42,11 @@ class VWAPPullbackStrategy(BaseStrategy):
     3. Previous candle pulled back to VWAP (low <= VWAP + tolerance)
     4. Previous candle CLOSED above VWAP (held above)
     5. Current (signal) candle: bullish close above prev high
+    6. Risk >= 0.2% of entry price (FIX 7)
 
     Stop Loss:  Below pullback candle low OR below VWAP (whichever is lower)
     Target 1R:  Move SL to breakeven
-    Target 2R:  Full exit
+    Target 2R:  Full exit (2.0 × risk)
 
     SHORT Setup: Mirror logic with inverted conditions.
     """
@@ -110,6 +120,7 @@ class VWAPPullbackStrategy(BaseStrategy):
         pullback_to_vwap_long = (
             prev_low is not None and
             prev_low <= vwap_curr + tol and
+            prev_close is not None and
             prev_close > vwap_curr
         )
 
@@ -123,8 +134,17 @@ class VWAPPullbackStrategy(BaseStrategy):
         if trend_up and pullback_to_vwap_long and confirmation_long:
             sl     = min(prev_low, vwap_curr - tol) - atr_val * 0.1
             risk   = close - sl
+
+            # FIX 7: Skip if risk is too small — protects against slippage eating the SL
+            risk_pct = risk / close if close > 0 else 0
+            if risk_pct < MIN_RISK_PCT:
+                logger.debug(
+                    f"VWAP Long skipped | {symbol} | risk {risk_pct*100:.3f}% "
+                    f"< min {MIN_RISK_PCT*100:.2f}% (too tight for slippage)"
+                )
+                return None
+
             target = close + 2.0 * risk
-            t1     = close + 1.0 * risk  # noqa: F841 — kept for reference
 
             conf = self._confidence(close, vwap_curr, ema20_curr, ema20_prev3,
                                     atr_val, "LONG")
@@ -138,7 +158,7 @@ class VWAPPullbackStrategy(BaseStrategy):
                        f"EMA20:{ema20_curr:.2f} ATR:{atr_val:.2f}")
             )
 
-            if signal.is_valid() and signal.reward_risk >= 1.3:
+            if signal.is_valid():
                 logger.info(f"SIGNAL: {signal}")
                 self._trade_taken.add(symbol)
                 return signal
@@ -155,23 +175,32 @@ class VWAPPullbackStrategy(BaseStrategy):
         pullback_to_vwap_short = (
             prev_high is not None and
             prev_high >= vwap_curr - tol and
+            prev_close is not None and
             prev_close < vwap_curr
         )
 
         confirmation_short = (
             close < open_ and
-            # FIX: was `(prev_low if prev_low else close)` — evaluates to close
-            #      when prev_low=0 or any falsy numeric value.
-            #      Changed to explicit None check.
+            # FIX (existing): explicit None check — old `if prev_low else close`
+            # would evaluate to `close` when prev_low=0 (falsy number)
             close < (prev_low if prev_low is not None else close) and
             high < vwap_curr + tol
         )
 
         if trend_down and pullback_to_vwap_short and confirmation_short:
-            sl     = max(prev_high, vwap_curr + tol) + atr_val * 0.1
-            risk   = sl - close
+            sl   = max(prev_high, vwap_curr + tol) + atr_val * 0.1
+            risk = sl - close
+
+            # FIX 7: Skip if risk is too small
+            risk_pct = risk / close if close > 0 else 0
+            if risk_pct < MIN_RISK_PCT:
+                logger.debug(
+                    f"VWAP Short skipped | {symbol} | risk {risk_pct*100:.3f}% "
+                    f"< min {MIN_RISK_PCT*100:.2f}% (too tight for slippage)"
+                )
+                return None
+
             target = close - 2.0 * risk
-            t1     = close - 1.0 * risk  # noqa: F841
 
             conf = self._confidence(close, vwap_curr, ema20_curr, ema20_prev3,
                                     atr_val, "SHORT")
@@ -185,7 +214,7 @@ class VWAPPullbackStrategy(BaseStrategy):
                        f"EMA20:{ema20_curr:.2f} ATR:{atr_val:.2f}")
             )
 
-            if signal.is_valid() and signal.reward_risk >= 1.3:
+            if signal.is_valid():
                 logger.info(f"SIGNAL: {signal}")
                 self._trade_taken.add(symbol)
                 return signal
@@ -196,7 +225,10 @@ class VWAPPullbackStrategy(BaseStrategy):
                     atr_val, direction) -> float:
         score = 50.0
 
-        ema_slope_pct = abs(ema20 - ema20_3ago) / ema20_3ago * 100 if ema20_3ago != 0 else 0
+        ema_slope_pct = (
+            abs(ema20 - ema20_3ago) / ema20_3ago * 100
+            if ema20_3ago and ema20_3ago != 0 else 0
+        )
         if ema_slope_pct > 0.05:
             score += 20
         elif ema_slope_pct > 0.02:
