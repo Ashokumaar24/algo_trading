@@ -4,20 +4,69 @@
 #  Scheduled launcher — runs automatically every weekday at 8:55 AM
 #  via Windows Task Scheduler (or cron on Linux/Mac)
 #
+#  FIX: Market hours guard added.
+#    If triggered outside the trading window (before 8:50 AM or
+#    after 15:30 IST), the script exits immediately WITHOUT
+#    launching main.py and WITHOUT attempting Zerodha login.
+#    This prevents OTP prompts when accidentally triggered
+#    outside market hours (e.g. manual test runs in the evening).
+#
 #  What it does:
 #    1. Checks if today is a trading day (Mon–Fri, not holiday)
-#    2. Sends Telegram: "System starting..."
-#    3. Launches main.py --dry-run (or main.py for live)
-#    4. Handles crashes and notifies you via Telegram
+#    2. Checks if current IST time is within the trading window
+#    3. Sends Telegram: "System starting..."
+#    4. Launches main.py --dry-run (or main.py for live)
+#    5. Handles crashes and notifies you via Telegram
 # ============================================================
 
 import os
 import sys
 import subprocess
-from datetime import datetime, date
+from datetime import datetime, date, time as dt_time
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
+
+IST = ZoneInfo("Asia/Kolkata")
+
+# ----------------------------------------------------------------
+# TRADING WINDOW — IST
+# ----------------------------------------------------------------
+# Script is allowed to launch main.py only within this window.
+# Before 8:50 AM: too early — market not open yet, scanner not useful
+# After 15:30 PM: market closed — no point logging in at all
+TRADING_WINDOW_START = dt_time(8, 50)   # 8:50 AM IST
+TRADING_WINDOW_END   = dt_time(15, 30)  # 3:30 PM IST
+
+
+def is_within_trading_window() -> tuple:
+    """
+    Returns (bool, str) — (is_within_window, reason_message)
+    Uses IST timezone for comparison.
+    """
+    now_ist  = datetime.now(IST)
+    now_time = now_ist.time()
+
+    if now_time < TRADING_WINDOW_START:
+        return False, (
+            f"Too early — current time {now_time.strftime('%H:%M')} IST "
+            f"is before trading window start ({TRADING_WINDOW_START.strftime('%H:%M')} IST)."
+        )
+
+    if now_time > TRADING_WINDOW_END:
+        return False, (
+            f"Market closed — current time {now_time.strftime('%H:%M')} IST "
+            f"is after trading window end ({TRADING_WINDOW_END.strftime('%H:%M')} IST).\n"
+            f"System will run tomorrow at 8:55 AM."
+        )
+
+    return True, "Within trading window ✓"
+
 
 # ----------------------------------------------------------------
 # NSE TRADING HOLIDAYS 2026 — update as needed
@@ -57,13 +106,16 @@ def send_telegram(message: str):
 
 def main():
     today = date.today()
-    now   = datetime.now()
+    now   = datetime.now(IST)
 
-    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] auto_start.py triggered")
+    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')} IST] auto_start.py triggered")
 
-    # ── Check if trading day ─────────────────────────────────────────
+    # ── Check 1: Is today a trading day? ────────────────────────────
     if not is_trading_day(today):
-        print(f"Today ({today.strftime('%A %d %b')}) is not a trading day. Exiting.")
+        msg = (
+            f"Today ({today.strftime('%A %d %b')}) is not a trading day. Exiting."
+        )
+        print(msg)
         send_telegram(
             f"📅 <b>No Trading Today</b>\n"
             f"{today.strftime('%A, %d %b %Y')} is a holiday or weekend.\n"
@@ -72,6 +124,25 @@ def main():
         return
 
     print(f"Today is a trading day ✓")
+
+    # ── Check 2: Are we within the trading window? ───────────────────
+    # THIS IS THE KEY FIX — prevents OTP prompt and login attempts
+    # when the script is triggered outside market hours.
+    in_window, window_msg = is_within_trading_window()
+
+    if not in_window:
+        print(f"\n⏰ OUTSIDE TRADING WINDOW: {window_msg}")
+        print("Exiting without logging in to Zerodha. No OTP will be requested.\n")
+
+        send_telegram(
+            f"⏰ <b>Auto-Start: Outside Trading Window</b>\n\n"
+            f"{window_msg}\n\n"
+            f"No Zerodha login was attempted.\n"
+            f"System will auto-start at 8:55 AM on the next trading day."
+        )
+        return
+
+    print(f"Time check: {window_msg}")
 
     # ── Determine mode ───────────────────────────────────────────────
     # Change LIVE_MODE = True when you're ready to go live
@@ -82,6 +153,7 @@ def main():
     send_telegram(
         f"⏰ <b>Auto-Start Triggered</b>\n\n"
         f"Date: {today.strftime('%d %b %Y (%A)')}\n"
+        f"Time: {now.strftime('%H:%M IST')}\n"
         f"Mode: {mode_str}\n"
         f"Launching system now...\n\n"
         f"Commands: /stop /status /help"
@@ -107,7 +179,7 @@ def main():
             send_telegram(
                 f"❌ <b>System Exited Unexpectedly</b>\n\n"
                 f"Exit code: {result.returncode}\n"
-                f"Time: {datetime.now().strftime('%H:%M IST')}\n\n"
+                f"Time: {datetime.now(IST).strftime('%H:%M IST')}\n\n"
                 f"⚠️ Check logs for details."
             )
 
@@ -120,7 +192,7 @@ def main():
         send_telegram(
             f"❌ <b>System Crashed</b>\n\n"
             f"Error: {str(e)}\n"
-            f"Time: {datetime.now().strftime('%H:%M IST')}\n\n"
+            f"Time: {datetime.now(IST).strftime('%H:%M IST')}\n\n"
             f"⚠️ Check your computer. Positions may be open!\n"
             f"Log in to Zerodha app immediately to check."
         )
