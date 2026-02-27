@@ -10,6 +10,7 @@
 import os
 import time
 import requests
+from pyotp import TOTP
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -175,18 +176,34 @@ def login(headless: bool = True) -> str:
     tg_token   = creds.get('tg_token', '')
     tg_chat_id = creds.get('tg_chat_id', '')
     tg_enabled = bool(tg_token and tg_token not in ('', 'YOUR_TELEGRAM_BOT_TOKEN'))
+    totp_key   = creds.get('totp_key', '')
+    totp_ok    = bool(totp_key and totp_key not in ('', 'YOUR_TOTP_BASE32_KEY'))
 
     # ── Get Telegram offset BEFORE sending OTP request ───────────────
     # This ensures we only read messages sent AFTER our prompt —
     # ignoring any old messages already in the inbox.
-    if not tg_enabled:
-        raise RuntimeError(
-            "Telegram not configured.\n"
-            "Set Telegram credentials in api_key.txt lines 6 and 7."
-        )
+    tg_offset = 0
+    if tg_enabled:
+        tg_offset = _get_latest_update_id(tg_token)
+        logger.info(f"Telegram offset snapshot: {tg_offset}")
 
-    tg_offset = _get_latest_update_id(tg_token)
-    logger.info(f"Telegram offset snapshot: {tg_offset}")
+    # ── If TOTP key missing → ask Telegram upfront ───────────────────
+    if not totp_ok:
+        if not tg_enabled:
+            raise RuntimeError(
+                "No TOTP key and Telegram not configured.\n"
+                "Set TOTP_BASE32_KEY in api_key.txt line 5, OR\n"
+                "Set Telegram credentials in lines 6 and 7."
+            )
+        logger.info("No TOTP key — asking Telegram for OTP before browser opens")
+        _send_telegram(tg_token, tg_chat_id,
+            "🔐 <b>Zerodha Login — OTP Needed</b>\n\n"
+            "👉 Open your <b>Zerodha app</b>\n"
+            "👉 Tap Profile → Security → and get the 6-digit code\n"
+            "👉 <b>Reply here with JUST the 6 digits</b>\n\n"
+            "⏳ You have <b>120 seconds</b>\n"
+            "Example: <code>482917</code>"
+        )
 
     # ── Setup Chrome ─────────────────────────────────────────────────
     options = Options()
@@ -226,38 +243,24 @@ def login(headless: bool = True) -> str:
         logger.info("Looking for OTP input field...")
         totp_field = _find_totp_field(driver, timeout=30)
 
-        # ── Step 4: Get OTP via Telegram ─────────────────────────────
-        logger.info("OTP field found — requesting code via Telegram...")
-        _send_telegram(tg_token, tg_chat_id,
-            "🔐 <b>Zerodha Login — OTP Needed</b>\n\n"
-            "👉 Open your <b>Zerodha / Authenticator app</b>\n"
-            "👉 <b>Reply here with JUST the 6-digit code</b>\n\n"
-            "⏳ You have <b>120 seconds</b>\n"
-            "Example: <code>482917</code>"
-        )
-        tg_offset = _get_latest_update_id(tg_token)  # snapshot AFTER sending prompt
-        otp = _wait_for_telegram_otp(tg_token, tg_chat_id, tg_offset, timeout_seconds=120)
-        if not otp:
-            raise TimeoutError("Login failed: No OTP received from Telegram within 120 seconds.")
+        # ── Step 4: Get OTP ───────────────────────────────────────────
+        if totp_ok:
+            otp = TOTP(totp_key).now()
+            logger.info(f"Using pyotp auto-TOTP: {otp}")
+        else:
+            logger.info("Waiting for your Telegram reply...")
+            otp = _wait_for_telegram_otp(tg_token, tg_chat_id, tg_offset, timeout_seconds=120)
+            if not otp:
+                raise TimeoutError("Login failed: No OTP received from Telegram within 120 seconds.")
 
         # ── Step 5: Enter OTP ─────────────────────────────────────────
-        # Re-find the field — the earlier reference is stale because the
-        # page may have re-rendered while waiting for your Telegram reply.
         logger.info(f"Entering OTP: {otp}")
-        totp_field = _find_totp_field(driver, timeout=15)
         totp_field.clear()
         totp_field.send_keys(otp)
         time.sleep(0.3)
-        # Zerodha auto-submits as soon as 6 digits are typed — the field
-        # goes stale immediately, so Keys.RETURN may fail. Catch it and
-        # try the submit button via JS as a fallback.
+        totp_field.send_keys(Keys.RETURN)
         try:
-            totp_field.send_keys(Keys.RETURN)
-        except Exception:
-            logger.debug("Keys.RETURN on OTP field skipped (auto-submitted)")
-        try:
-            btn = driver.find_element(By.XPATH, "//button[@type='submit']")
-            driver.execute_script("arguments[0].click();", btn)
+            driver.find_element(By.XPATH, "//button[@type='submit']").click()
         except Exception:
             pass
 
@@ -272,6 +275,57 @@ def login(headless: bool = True) -> str:
                 logger.info(f"request_token obtained: {request_token[:8]}...")
                 break
             time.sleep(1)
+
+        # ── pyotp failed → Telegram fallback ─────────────────────────
+        if not request_token and totp_ok:
+            logger.warning("pyotp TOTP rejected — falling back to Telegram OTP")
+
+            if not tg_enabled:
+                raise RuntimeError(
+                    "Auto-TOTP failed and Telegram is not configured.\n"
+                    "Fix TOTP_BASE32_KEY in api_key.txt line 5, OR\n"
+                    "Add Telegram credentials to lines 6 and 7."
+                )
+
+            # Snapshot offset again before sending the prompt
+            tg_offset = _get_latest_update_id(tg_token)
+
+            _send_telegram(tg_token, tg_chat_id,
+                "🔐 <b>OTP Required</b>\n\n"
+                "Auto-login failed (TOTP key incorrect).\n\n"
+                "👉 Open your <b>Zerodha app</b>\n"
+                "👉 Reply with the fresh 6-digit code\n\n"
+                "⏳ You have <b>90 seconds</b>."
+            )
+
+            try:
+                totp_field = _find_totp_field(driver, timeout=5)
+                totp_field.clear()
+            except Exception:
+                pass
+
+            user_otp = _wait_for_telegram_otp(tg_token, tg_chat_id, tg_offset, timeout_seconds=90)
+            if not user_otp:
+                raise TimeoutError("Login failed: No OTP received via Telegram within 90 seconds.")
+
+            totp_field = _find_totp_field(driver, timeout=15)
+            totp_field.clear()
+            totp_field.send_keys(user_otp)
+            totp_field.send_keys(Keys.RETURN)
+            logger.info(f"Telegram OTP entered: {user_otp}")
+
+            try:
+                driver.find_element(By.XPATH, "//button[@type='submit']").click()
+            except Exception:
+                pass
+
+            deadline2 = time.time() + 40
+            while time.time() < deadline2:
+                if "request_token=" in driver.current_url:
+                    request_token = driver.current_url.split("request_token=")[1].split("&")[0]
+                    logger.info(f"request_token obtained after Telegram OTP: {request_token[:8]}...")
+                    break
+                time.sleep(1)
 
         if not request_token:
             raise RuntimeError(
